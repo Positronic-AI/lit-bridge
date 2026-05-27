@@ -160,7 +160,12 @@ class JsonlWatcher:
 
             if entry.get('type') == 'assistant':
                 msg = entry.get('message', {})
-                for block in msg.get('content', []):
+                content_blocks = msg.get('content', [])
+                if not isinstance(content_blocks, list):
+                    continue
+                for block in content_blocks:
+                    if not isinstance(block, dict):
+                        continue
                     if block.get('type') == 'tool_use':
                         tool_id = block.get('id', '')
                         if tool_id not in self._emitted_tool_ids:
@@ -180,7 +185,12 @@ class JsonlWatcher:
                             })
             elif entry.get('type') == 'user':
                 msg = entry.get('message', {})
-                for block in msg.get('content', []):
+                content_blocks = msg.get('content', [])
+                if not isinstance(content_blocks, list):
+                    continue
+                for block in content_blocks:
+                    if not isinstance(block, dict):
+                        continue
                     if block.get('type') == 'tool_result':
                         tool_id = block.get('tool_use_id', '')
                         content = block.get('content', '')
@@ -665,13 +675,18 @@ class Monitor:
     async def _handle_client(self, reader: asyncio.StreamReader,
                               writer: asyncio.StreamWriter):
         """Handle a single Connector client connection."""
-        peer = "client"
-        log.info(f"Client connected ({len(self._event_buffer)} buffered events)")
+        buffered_count = len(self._event_buffer)
+        log.info(f"Client connected ({buffered_count} buffered events)")
 
         old_writer = self._client_writer
         self._client_writer = writer
 
-        # Flush buffered events from disconnection period
+        # Send monitor_ready first — Connector expects this as the handshake
+        self._emit({"event": "monitor_ready",
+                     "sessions": len(self.sessions),
+                     "buffered": buffered_count})
+
+        # Then flush buffered events from disconnection period
         flushed = 0
         while self._event_buffer:
             line = self._event_buffer.popleft()
@@ -683,10 +698,6 @@ class Monitor:
                 return
         if flushed:
             log.info(f"Flushed {flushed} buffered events to client")
-
-        # Send current state snapshot
-        self._emit({"event": "monitor_ready",
-                     "sessions": len(self.sessions)})
 
         try:
             while self._running:
@@ -765,6 +776,12 @@ def main():
     parser.add_argument("--socket", metavar="PATH",
                         help="Listen on a Unix domain socket (daemon mode)")
     args = parser.parse_args()
+
+    if args.socket:
+        log_path = Path(args.socket).with_suffix('.log')
+        fh = logging.FileHandler(str(log_path))
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        logging.getLogger().addHandler(fh)
 
     monitor = Monitor(socket_path=args.socket)
     asyncio.run(monitor.run())
