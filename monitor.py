@@ -2,9 +2,17 @@
 """lit-monitor: AI CLI session multiplexer.
 
 A lightweight daemon that manages interactive AI CLI sessions in tmux.
-Speaks JSON-lines on stdin/stdout. Knows nothing about LIT.
+Speaks JSON-lines protocol. Knows nothing about LIT.
 
-Protocol:
+Modes:
+  stdio:   reads stdin, writes stdout (legacy, dies with parent)
+  socket:  listens on a Unix domain socket (daemon, survives API restarts)
+
+Usage:
+  python3 monitor.py                          # stdio mode
+  python3 monitor.py --socket /tmp/lit-monitor-ben.sock   # socket mode
+
+Protocol (same in both modes):
   → {"cmd": "create", "session": "name", "cli": "claude", "parser": "claude-code",
      "args": ["--model", "opus"], "working_dir": "/some/path", "env": {"K": "V"}}
   ← {"session": "name", "event": "ready"}
@@ -23,12 +31,15 @@ Protocol:
   ← {"event": "pong"}
 """
 
+import argparse
 import asyncio
+import collections
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import sys
 import time
 from pathlib import Path
@@ -49,6 +60,7 @@ POLL_INTERVAL = 0.3
 STARTUP_WAIT = 3.0
 QUIESCENCE_TIMEOUT = 5.0
 NO_PROGRESS_TIMEOUT = 30.0
+EVENT_BUFFER_MAX = 500
 
 PARSERS = {
     "claude-code": ClaudeTUIParser,
@@ -213,16 +225,28 @@ class ManagedSession:
 
 class Monitor:
 
-    def __init__(self):
+    def __init__(self, socket_path: str = None):
         self.sessions: Dict[str, ManagedSession] = {}
         self._running = True
+        self._socket_path = socket_path
+        self._client_writer: Optional[asyncio.StreamWriter] = None
+        self._event_buffer: collections.deque = collections.deque(maxlen=EVENT_BUFFER_MAX)
 
     # ── Output ──────────────────────────────────────────────
 
     def _emit(self, event: dict):
-        line = json.dumps(event, ensure_ascii=False)
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        if self._client_writer and not self._client_writer.is_closing():
+            try:
+                self._client_writer.write(line.encode('utf-8'))
+            except (ConnectionError, RuntimeError):
+                self._client_writer = None
+                self._event_buffer.append(line)
+        elif self._socket_path:
+            self._event_buffer.append(line)
+        else:
+            sys.stdout.write(line)
+            sys.stdout.flush()
 
     def _emit_error(self, session: str, message: str):
         self._emit({"session": session, "event": "error", "message": message})
@@ -560,14 +584,22 @@ class Monitor:
     # ── Main loop ───────────────────────────────────────────
 
     async def run(self):
-        log.info("lit-monitor starting")
+        log.info(f"lit-monitor starting (mode={'socket' if self._socket_path else 'stdio'})")
 
-        # Discover existing lit-* tmux sessions
         await self._discover_existing()
 
         self._emit({"event": "monitor_ready",
                      "sessions": len(self.sessions)})
 
+        if self._socket_path:
+            await self._run_socket()
+        else:
+            await self._run_stdio()
+
+        await self._shutdown()
+
+    async def _run_stdio(self):
+        """Legacy stdin/stdout mode — dies when parent dies."""
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
         await asyncio.get_event_loop().connect_read_pipe(
@@ -599,7 +631,89 @@ class Monitor:
             except Exception as e:
                 log.error(f"Command loop error: {e}", exc_info=True)
 
-        await self._shutdown()
+    async def _run_socket(self):
+        """Unix domain socket mode — survives Connector restarts."""
+        sock_path = Path(self._socket_path)
+        if sock_path.exists():
+            sock_path.unlink()
+        sock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        pid_path = sock_path.with_suffix('.pid')
+        pid_path.write_text(str(os.getpid()))
+
+        server = await asyncio.start_unix_server(
+            self._handle_client, path=str(sock_path)
+        )
+        os.chmod(str(sock_path), 0o600)
+        log.info(f"Listening on {sock_path} (pid={os.getpid()})")
+
+        loop = asyncio.get_event_loop()
+        stop = asyncio.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+
+        await stop.wait()
+        server.close()
+        await server.wait_closed()
+
+        for p in (sock_path, pid_path):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+    async def _handle_client(self, reader: asyncio.StreamReader,
+                              writer: asyncio.StreamWriter):
+        """Handle a single Connector client connection."""
+        peer = "client"
+        log.info(f"Client connected ({len(self._event_buffer)} buffered events)")
+
+        old_writer = self._client_writer
+        self._client_writer = writer
+
+        # Flush buffered events from disconnection period
+        flushed = 0
+        while self._event_buffer:
+            line = self._event_buffer.popleft()
+            try:
+                writer.write(line.encode('utf-8') if isinstance(line, str) else line)
+                flushed += 1
+            except (ConnectionError, RuntimeError):
+                self._client_writer = None
+                return
+        if flushed:
+            log.info(f"Flushed {flushed} buffered events to client")
+
+        # Send current state snapshot
+        self._emit({"event": "monitor_ready",
+                     "sessions": len(self.sessions)})
+
+        try:
+            while self._running:
+                line = await reader.readline()
+                if not line:
+                    break
+
+                text = line.decode('utf-8', errors='replace').strip()
+                if not text:
+                    continue
+
+                try:
+                    cmd = json.loads(text)
+                except json.JSONDecodeError as e:
+                    self._emit({"event": "error",
+                                 "message": f"invalid JSON: {e}"})
+                    continue
+
+                await self.handle_command(cmd)
+
+        except (asyncio.CancelledError, ConnectionError):
+            pass
+        finally:
+            if self._client_writer is writer:
+                self._client_writer = None
+            writer.close()
+            log.info(f"Client disconnected (buffering events)")
 
     async def _discover_existing(self):
         """Find running lit-* tmux sessions on startup."""
@@ -647,7 +761,12 @@ class Monitor:
 
 
 def main():
-    monitor = Monitor()
+    parser = argparse.ArgumentParser(description="lit-monitor: AI CLI session multiplexer")
+    parser.add_argument("--socket", metavar="PATH",
+                        help="Listen on a Unix domain socket (daemon mode)")
+    args = parser.parse_args()
+
+    monitor = Monitor(socket_path=args.socket)
     asyncio.run(monitor.run())
 
 
