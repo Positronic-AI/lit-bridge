@@ -15,10 +15,15 @@ class ClaudeTUIParser(TUIParser):
     RE_USER = re.compile(r'^\s*❯\s')
     RE_RESPONSE = re.compile(r'^\s*●\s')
     RE_COMPLETION = re.compile(r'^\s*✻\s+(.+)')
+    RE_THINKING_SPINNER = re.compile(r'^\s*✽\s')
     RE_SEPARATOR = re.compile(r'^─{10,}$')
     RE_STATUS = re.compile(r'^\s*⏵')
     RE_VERSION = re.compile(r'Claude Code (v[\d.]+)')
     RE_DIALOG_SELECTION = re.compile(r'❯\s+\d+\.\s')
+    RE_SPINNER_LINE = re.compile(r'^\s*[✽✢]\s')
+    RE_TOOL_INDICATOR = re.compile(r'^\s*⎿\s')
+    RE_TOOL_HEADER = re.compile(r'^\s*●\s+(Reading|Writing|Editing|Running|Searching|Listing)\s')
+    RE_TOKEN_STATS = re.compile(r'\(.*?[↓↑]\s*\d+\s*tokens?\)')
 
     DIALOG_STRINGS = [
         "Enter to confirm",
@@ -26,6 +31,7 @@ class ClaudeTUIParser(TUIParser):
     ]
 
     STARTUP_DIALOGS = [
+        ("Select login method", ["Enter"], "login-method"),
         ("Yes, I accept", ["Down", "Enter"], "bypass-permissions"),
         ("Choose the text style", ["Enter"], "theme-selection"),
         ("enable auto mode", ["Enter"], "auto-mode"),
@@ -33,6 +39,23 @@ class ClaudeTUIParser(TUIParser):
         ("I trust this folder", ["Enter"], "workspace-trust"),
         ("safety check", ["Enter"], "workspace-trust"),
     ]
+
+    def _is_tui_chrome(self, line: str) -> bool:
+        """Return True if this line is TUI chrome, not real content."""
+        s = line.strip()
+        if not s:
+            return False
+        if self.RE_SPINNER_LINE.match(s):
+            return True
+        if self.RE_TOOL_INDICATOR.match(s):
+            return True
+        if self.RE_TOOL_HEADER.match(s):
+            return True
+        if self.RE_TOKEN_STATS.match(s):
+            return True
+        if 'ctrl+o to expand' in s or 'ctrl+e to expand' in s:
+            return True
+        return False
 
     def detect_state(self, capture: str) -> SessionState:
         if not capture or not capture.strip():
@@ -57,12 +80,14 @@ class ClaudeTUIParser(TUIParser):
                 return SessionState.IDLE
             if self.RE_COMPLETION.match(line):
                 return SessionState.IDLE
+            if self.RE_THINKING_SPINNER.match(line):
+                return SessionState.THINKING
             break
 
         last_bullet = capture.rfind('●')
         if last_bullet >= 0:
             after = capture[last_bullet:]
-            if '✻' not in after:
+            if '✻' not in after and '✽' not in after:
                 return SessionState.RESPONDING
 
         return SessionState.THINKING
@@ -92,8 +117,11 @@ class ClaudeTUIParser(TUIParser):
                 continue
 
             if self.RE_RESPONSE.match(stripped):
-                text = re.sub(r'^\s*●\s*', '', stripped)
+                first_line = re.sub(r'^\s*●\s*', '', stripped)
                 duration = None
+                content_lines = []
+                if first_line and not self._is_tui_chrome('● ' + first_line):
+                    content_lines.append(first_line)
                 i += 1
                 while i < len(lines):
                     s = lines[i].strip()
@@ -102,15 +130,18 @@ class ClaudeTUIParser(TUIParser):
                         duration = m.group(1)
                         i += 1
                         break
-                    if (self.RE_SEPARATOR.match(s) or
+                    if (self.RE_RESPONSE.match(s) or
+                            self.RE_SEPARATOR.match(s) or
                             self.RE_STATUS.match(s) or
                             self.RE_USER.match(s)):
                         break
-                    text += '\n' + lines[i].rstrip()
+                    if not self._is_tui_chrome(s):
+                        content_lines.append(lines[i].rstrip())
                     i += 1
+                text = '\n'.join(content_lines).rstrip()
                 messages.append(TUIMessage(
                     role="assistant",
-                    content=text.rstrip(),
+                    content=text,
                     duration=duration,
                 ))
                 continue
@@ -128,7 +159,9 @@ class ClaudeTUIParser(TUIParser):
         assistant_msgs = [m for m in messages if m.role == "assistant"]
         if len(assistant_msgs) <= baseline_count:
             return ""
-        return assistant_msgs[-1].content
+        # Concatenate ALL new assistant blocks (tool calls + text)
+        new_msgs = assistant_msgs[baseline_count:]
+        return "\n\n".join(m.content for m in new_msgs)
 
     def is_startup_dialog(self, capture: str) -> Optional[Tuple[str, List[str], str]]:
         for detect, keys, name in self.STARTUP_DIALOGS:

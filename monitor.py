@@ -26,10 +26,13 @@ Protocol:
 import asyncio
 import json
 import logging
+import os
+import re
 import shutil
 import sys
 import time
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from tmux_session import TmuxSession, sanitize_name
 from parsers import SessionState, ClaudeTUIParser
@@ -63,16 +66,149 @@ def find_cli(name: str) -> str:
     return path
 
 
+def _cc_project_dir(working_dir: str) -> Path:
+    """Derive Claude Code's project directory from a working directory path."""
+    slug = re.sub(r'[^a-zA-Z0-9]', '-', working_dir.lstrip('/'))
+    return Path.home() / ".claude" / "projects" / f"-{slug}"
+
+
+class JsonlWatcher:
+    """Tails a Claude Code JSONL file for tool_use/tool_result events."""
+
+    def __init__(self, project_dir: Path):
+        self._project_dir = project_dir
+        self._file: Optional[Path] = None
+        self._pos: int = 0
+        self._emitted_tool_ids: set = set()
+
+    def _find_active_jsonl(self) -> Optional[Path]:
+        """Find the most recently modified JSONL in the project dir."""
+        if not self._project_dir.is_dir():
+            return None
+        jsonls = sorted(
+            self._project_dir.glob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return jsonls[0] if jsonls else None
+
+    def begin_turn(self):
+        """Call when a new send starts — find/reset the active JSONL."""
+        self._file = self._find_active_jsonl()
+        if self._file and self._file.exists():
+            self._pos = self._file.stat().st_size
+        else:
+            self._pos = 0
+        self._emitted_tool_ids.clear()
+
+    def poll(self) -> List[dict]:
+        """Read new JSONL entries and return tool events."""
+        if not self._file or not self._file.exists():
+            self._file = self._find_active_jsonl()
+            if not self._file:
+                return []
+            self._pos = 0
+
+        try:
+            size = self._file.stat().st_size
+        except OSError:
+            return []
+
+        if size <= self._pos:
+            # No new data — check if Claude Code started a new JSONL
+            newest = self._find_active_jsonl()
+            if newest and newest != self._file:
+                self._file = newest
+                self._pos = 0
+                try:
+                    size = self._file.stat().st_size
+                except OSError:
+                    return []
+                if size <= self._pos:
+                    return []
+            else:
+                return []
+
+        events = []
+        try:
+            with open(self._file, 'r', encoding='utf-8', errors='replace') as f:
+                f.seek(self._pos)
+                new_data = f.read()
+                self._pos = f.tell()
+        except OSError:
+            return []
+
+        for line in new_data.strip().split('\n'):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if entry.get('type') == 'assistant':
+                msg = entry.get('message', {})
+                for block in msg.get('content', []):
+                    if block.get('type') == 'tool_use':
+                        tool_id = block.get('id', '')
+                        if tool_id not in self._emitted_tool_ids:
+                            self._emitted_tool_ids.add(tool_id)
+                            events.append({
+                                "event": "tool_use",
+                                "tool_use_id": tool_id,
+                                "name": block.get('name', ''),
+                                "input": block.get('input', {}),
+                            })
+                    elif block.get('type') == 'text':
+                        text = block.get('text', '').strip()
+                        if text:
+                            events.append({
+                                "event": "jsonl_text",
+                                "text": text,
+                            })
+            elif entry.get('type') == 'user':
+                msg = entry.get('message', {})
+                for block in msg.get('content', []):
+                    if block.get('type') == 'tool_result':
+                        tool_id = block.get('tool_use_id', '')
+                        content = block.get('content', '')
+                        if isinstance(content, list):
+                            text_parts = []
+                            for c in content:
+                                if isinstance(c, dict) and c.get('type') == 'text':
+                                    text_parts.append(c.get('text', ''))
+                                elif isinstance(c, str):
+                                    text_parts.append(c)
+                            content = '\n'.join(text_parts)
+                        if len(str(content)) > 5000:
+                            content = str(content)[:5000] + "…"
+                        events.append({
+                            "event": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": content,
+                        })
+
+        if events:
+            log.info(f"JSONL watcher: {len(events)} tool events from {self._file.name}")
+        return events
+
+
 class ManagedSession:
     """A tmux session + its parser + observer state."""
 
-    def __init__(self, name: str, tmux: TmuxSession, parser: TUIParser):
+    def __init__(self, name: str, tmux: TmuxSession, parser: TUIParser,
+                 working_dir: str = None):
         self.name = name
         self.tmux = tmux
         self.parser = parser
         self.state = SessionState.STARTING
         self.observing = False
         self._observe_task: Optional[asyncio.Task] = None
+        self._jsonl_watcher: Optional[JsonlWatcher] = None
+        if working_dir:
+            project_dir = _cc_project_dir(working_dir)
+            self._jsonl_watcher = JsonlWatcher(project_dir)
+            log.info(f"[{name}] JSONL watcher: {project_dir}")
 
 
 class Monitor:
@@ -99,6 +235,8 @@ class Monitor:
             await self._cmd_create(cmd)
         elif action == "send":
             await self._cmd_send(cmd)
+        elif action == "input":
+            await self._cmd_input(cmd)
         elif action == "keystroke":
             await self._cmd_keystroke(cmd)
         elif action == "kill":
@@ -157,7 +295,7 @@ class Monitor:
             self._emit_error(name, f"spawn failed: {e}")
             return
 
-        ms = ManagedSession(name, tmux, parser)
+        ms = ManagedSession(name, tmux, parser, working_dir=working_dir)
         self.sessions[name] = ms
 
         await asyncio.sleep(STARTUP_WAIT)
@@ -225,6 +363,9 @@ class Monitor:
         full_capture = await ms.tmux.capture_pane()
         baseline_count = ms.parser.count_assistant_messages(full_capture)
 
+        if ms._jsonl_watcher:
+            ms._jsonl_watcher.begin_turn()
+
         log.info(f"[{name}] Sending {len(content)} chars (baseline={baseline_count})")
 
         try:
@@ -243,6 +384,26 @@ class Monitor:
         ms._baseline_count = baseline_count
         ms._yielded = ""
         ms.observing = True
+
+    async def _cmd_input(self, cmd: dict):
+        """Send text to session without triggering observation.
+
+        Used for slash commands like /model, /effort that produce
+        brief output but shouldn't be treated as a response turn.
+        """
+        name = cmd.get("session")
+        content = cmd.get("content", "")
+
+        ms = self.sessions.get(name)
+        if not ms:
+            self._emit_error(name, "session not found")
+            return
+
+        try:
+            await ms.tmux.send_message(content)
+            self._emit({"session": name, "event": "input_sent"})
+        except RuntimeError as e:
+            self._emit_error(name, f"input failed: {e}")
 
     async def _cmd_keystroke(self, cmd: dict):
         name = cmd.get("session")
@@ -358,6 +519,13 @@ class Monitor:
                                      "text": new_text})
                         ms._yielded = response
                         last_response_change = now
+
+                    # Emit structured tool events from JSONL
+                    if ms._jsonl_watcher:
+                        for tool_evt in ms._jsonl_watcher.poll():
+                            tool_evt["session"] = ms.name
+                            self._emit(tool_evt)
+                            last_response_change = now
 
                     # Completion: back to idle with content
                     if ms._yielded and new_state == SessionState.IDLE:
