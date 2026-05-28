@@ -71,13 +71,25 @@ class ClaudeTUIParser(TUIParser):
         if not lines:
             return SessionState.DEAD
 
+        # Check status bar for processing indicators
         for line in reversed(lines):
             if self.RE_STATUS.match(line):
-                return SessionState.IDLE
+                if 'esc to interrupt' in line or 'interrupt' in line:
+                    return SessionState.THINKING
+                break
             if self.RE_SEPARATOR.match(line):
                 continue
-            if line == '❯':
-                return SessionState.IDLE
+            if line.startswith('❯'):
+                continue
+            break
+
+        for line in reversed(lines):
+            if self.RE_STATUS.match(line):
+                continue
+            if self.RE_SEPARATOR.match(line):
+                continue
+            if line.startswith('❯'):
+                continue
             if self.RE_COMPLETION.match(line):
                 return SessionState.IDLE
             if self.RE_THINKING_SPINNER.match(line):
@@ -90,7 +102,7 @@ class ClaudeTUIParser(TUIParser):
             if '✻' not in after and '✽' not in after:
                 return SessionState.RESPONDING
 
-        return SessionState.THINKING
+        return SessionState.IDLE
 
     def extract_messages(self, capture: str) -> List[TUIMessage]:
         lines = capture.split('\n')

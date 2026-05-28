@@ -59,6 +59,7 @@ log = logging.getLogger("lit-monitor")
 POLL_INTERVAL = 0.3
 STARTUP_WAIT = 3.0
 QUIESCENCE_TIMEOUT = 5.0
+AUTO_OBSERVE_COOLDOWN = 1.5
 NO_PROGRESS_TIMEOUT = 30.0
 EVENT_BUFFER_MAX = 500
 
@@ -214,6 +215,34 @@ class JsonlWatcher:
             log.info(f"JSONL watcher: {len(events)} tool events from {self._file.name}")
         return events
 
+    def get_last_user_message(self) -> Optional[str]:
+        """Read the JSONL backwards to find the most recent user text message."""
+        f = self._file or self._find_active_jsonl()
+        if not f or not f.exists():
+            return None
+        try:
+            lines = f.read_text(encoding='utf-8', errors='replace').strip().split('\n')
+        except OSError:
+            return None
+        for line in reversed(lines):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get('type') not in ('human', 'user'):
+                continue
+            msg = entry.get('message', {})
+            content = msg.get('content', '')
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get('type') == 'text':
+                        text = block.get('text', '').strip()
+                        if text:
+                            return text
+        return None
+
 
 class ManagedSession:
     """A tmux session + its parser + observer state."""
@@ -223,6 +252,7 @@ class ManagedSession:
         self.name = name
         self.tmux = tmux
         self.parser = parser
+        self.working_dir = working_dir
         self.state = SessionState.STARTING
         self.observing = False
         self._observe_task: Optional[asyncio.Task] = None
@@ -381,17 +411,25 @@ class Monitor:
                          "from": ms.state.value, "to": "dead"})
             return
 
-        visible = await ms.tmux.capture_pane(visible_only=True)
-        current_state = ms.parser.detect_state(visible)
+        # Wait for session to become ready (handles startup rendering + organic responses)
+        for attempt in range(20):
+            visible = await ms.tmux.capture_pane(visible_only=True)
+            current_state = ms.parser.detect_state(visible)
 
-        if current_state == SessionState.DIALOG:
-            self._emit({"session": name, "event": "error",
-                         "message": "session is in dialog state, use keystroke command"})
-            return
+            if current_state == SessionState.DIALOG:
+                self._emit({"session": name, "event": "error",
+                             "message": "session is in dialog state, use keystroke command"})
+                return
 
-        if current_state not in (SessionState.IDLE, SessionState.THINKING):
+            if current_state in (SessionState.IDLE, SessionState.THINKING):
+                break
+
+            if attempt == 0:
+                log.info(f"[{name}] Waiting for idle (currently {current_state.value})")
+            await asyncio.sleep(0.5)
+        else:
             self._emit({"session": name, "event": "error",
-                         "message": f"session is {current_state.value}, not ready"})
+                         "message": f"session is {current_state.value}, not ready after 10s"})
             return
 
         full_capture = await ms.tmux.capture_pane()
@@ -512,7 +550,9 @@ class Monitor:
         prev_state = ms.state
         last_response_change = time.monotonic()
         last_capture_change = time.monotonic()
+        last_observe_complete = time.monotonic()
         prev_capture = ""
+        poll_count = 0
 
         while self._running:
             try:
@@ -527,12 +567,23 @@ class Monitor:
 
                 visible = await ms.tmux.capture_pane(visible_only=True)
                 now = time.monotonic()
+                poll_count += 1
+
+                if poll_count % 100 == 0:
+                    log.info(f"[{ms.name}] heartbeat poll={poll_count} "
+                             f"state={prev_state.value} observing={ms.observing} "
+                             f"client={'yes' if self._client_writer else 'no'}")
 
                 if visible != prev_capture:
                     last_capture_change = now
                     prev_capture = visible
 
                 new_state = ms.parser.detect_state(visible)
+
+                # Log state changes for diagnostics
+                if new_state != prev_state:
+                    log.info(f"[{ms.name}] State: {prev_state.value} → {new_state.value} "
+                             f"(observing={ms.observing})")
 
                 # Emit state transitions
                 if new_state != prev_state:
@@ -541,7 +592,25 @@ class Monitor:
                     prev_state = new_state
                     ms.state = new_state
 
-                # Emit response chunks when actively observing a send
+                # Auto-observe: detect organic interaction (direct tmux typing).
+                # Runs every poll, not just on transitions — if we miss the exact
+                # IDLE→THINKING edge, steady-state detection still catches it.
+                if (not ms.observing and
+                        new_state in (SessionState.THINKING, SessionState.RESPONDING) and
+                        (now - last_observe_complete) > AUTO_OBSERVE_COOLDOWN):
+                    full_capture = await ms.tmux.capture_pane()
+                    ms._baseline_count = ms.parser.count_assistant_messages(full_capture)
+                    ms._yielded = ""
+                    if ms._jsonl_watcher:
+                        user_msg = ms._jsonl_watcher.get_last_user_message()
+                        if user_msg:
+                            self._emit({"session": ms.name, "event": "user_input",
+                                         "text": user_msg})
+                        ms._jsonl_watcher.begin_turn()
+                    ms.observing = True
+                    log.info(f"[{ms.name}] Auto-observing organic interaction")
+
+                # Emit response chunks when actively observing
                 if ms.observing and hasattr(ms, '_baseline_count'):
                     full_capture = await ms.tmux.capture_pane()
                     response = ms.parser.extract_new_response(
@@ -566,24 +635,27 @@ class Monitor:
                         self._emit({"session": ms.name, "event": "complete",
                                      "total_length": len(ms._yielded)})
                         ms.observing = False
+                        last_observe_complete = now
                         log.info(f"[{ms.name}] Response complete ({len(ms._yielded)} chars)")
 
                     # Quiescence: response stopped growing
-                    if (ms._yielded and
+                    elif (ms._yielded and
                             (now - last_response_change) > QUIESCENCE_TIMEOUT and
                             new_state in (SessionState.IDLE, SessionState.RESPONDING)):
                         self._emit({"session": ms.name, "event": "complete",
                                      "total_length": len(ms._yielded),
                                      "reason": "quiescence"})
                         ms.observing = False
+                        last_observe_complete = now
                         log.info(f"[{ms.name}] Response complete (quiescence)")
 
                     # No progress timeout
-                    if (not ms._yielded and
+                    elif (not ms._yielded and
                             (now - last_capture_change) > NO_PROGRESS_TIMEOUT):
                         self._emit({"session": ms.name, "event": "error",
                                      "message": "no progress timeout"})
                         ms.observing = False
+                        last_observe_complete = now
 
             except asyncio.CancelledError:
                 break
@@ -682,8 +754,12 @@ class Monitor:
         self._client_writer = writer
 
         # Send monitor_ready first — Connector expects this as the handshake
+        session_info = {}
+        for name, ms in self.sessions.items():
+            session_info[name] = {"working_dir": ms.working_dir}
         self._emit({"event": "monitor_ready",
                      "sessions": len(self.sessions),
+                     "session_info": session_info,
                      "buffered": buffered_count})
 
         # Then flush buffered events from disconnection period
