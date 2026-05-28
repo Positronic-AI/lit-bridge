@@ -61,6 +61,7 @@ STARTUP_WAIT = 3.0
 QUIESCENCE_TIMEOUT = 5.0
 AUTO_OBSERVE_COOLDOWN = 1.5
 NO_PROGRESS_TIMEOUT = 30.0
+IDLE_REAP_TIMEOUT = 600.0  # 10 minutes idle → kill session, resumable
 EVENT_BUFFER_MAX = 500
 
 PARSERS = {
@@ -215,6 +216,80 @@ class JsonlWatcher:
             log.info(f"JSONL watcher: {len(events)} tool events from {self._file.name}")
         return events
 
+    def get_turn_metadata(self) -> Optional[dict]:
+        """Aggregate usage stats from the most recent turn's JSONL entries.
+
+        Reads backwards from the end to find all assistant messages in the
+        current turn (until we hit a user message that isn't a tool_result).
+        Sums token counts across multi-step tool-use turns.
+        """
+        f = self._file or self._find_active_jsonl()
+        if not f or not f.exists():
+            return None
+        try:
+            lines = f.read_text(encoding='utf-8', errors='replace').strip().split('\n')
+        except OSError:
+            return None
+
+        total_input = 0
+        total_output = 0
+        total_cache_read = 0
+        total_cache_create = 0
+        num_steps = 0
+        model = None
+
+        for line in reversed(lines):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if entry.get('type') == 'assistant':
+                msg = entry.get('message', {})
+                usage = msg.get('usage', {})
+                if usage:
+                    total_input += usage.get('input_tokens', 0)
+                    total_output += usage.get('output_tokens', 0)
+                    total_cache_read += usage.get('cache_read_input_tokens', 0)
+                    total_cache_create += usage.get('cache_creation_input_tokens', 0)
+                    num_steps += 1
+                    if not model:
+                        model = msg.get('model')
+            elif entry.get('type') == 'user':
+                msg = entry.get('message', {})
+                content = msg.get('content', [])
+                if isinstance(content, list):
+                    has_tool_result = any(
+                        isinstance(b, dict) and b.get('type') == 'tool_result'
+                        for b in content
+                    )
+                    if has_tool_result:
+                        continue
+                break
+            elif entry.get('type') in ('system', 'attachment', 'mode'):
+                continue
+            else:
+                break
+
+        if num_steps == 0:
+            return None
+
+        return {
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "cache_read_tokens": total_cache_read,
+            "cache_create_tokens": total_cache_create,
+            "num_steps": num_steps,
+            "model": model,
+        }
+
+    def get_session_id(self) -> Optional[str]:
+        """Get the Claude Code session ID from the active JSONL filename."""
+        f = self._file or self._find_active_jsonl()
+        if not f:
+            return None
+        return f.stem  # filename without .jsonl extension
+
     def get_last_user_message(self) -> Optional[str]:
         """Read the JSONL backwards to find the most recent user text message."""
         f = self._file or self._find_active_jsonl()
@@ -257,6 +332,8 @@ class ManagedSession:
         self.observing = False
         self._observe_task: Optional[asyncio.Task] = None
         self._jsonl_watcher: Optional[JsonlWatcher] = None
+        self._claude_session_id: Optional[str] = None
+        self._last_active: float = time.monotonic()
         if working_dir:
             project_dir = _cc_project_dir(working_dir)
             self._jsonl_watcher = JsonlWatcher(project_dir)
@@ -267,6 +344,7 @@ class Monitor:
 
     def __init__(self, socket_path: str = None):
         self.sessions: Dict[str, ManagedSession] = {}
+        self._reaped_sessions: Dict[str, dict] = {}  # name → {session_id, working_dir, args, env}
         self._running = True
         self._socket_path = socket_path
         self._client_writer: Optional[asyncio.StreamWriter] = None
@@ -342,9 +420,15 @@ class Monitor:
             self._emit_error(name, str(e))
             return
 
-        cli_args = cmd.get("args", [])
+        cli_args = list(cmd.get("args", []))
         working_dir = cmd.get("working_dir")
         env_vars = cmd.get("env", {})
+
+        # Resume from a previously reaped idle session
+        reaped = self._reaped_sessions.pop(name, None)
+        if reaped and reaped.get("session_id"):
+            cli_args.extend(["--resume", reaped["session_id"]])
+            log.info(f"[{name}] Resuming from reaped session {reaped['session_id']}")
 
         full_cmd = [cli_path] + cli_args
 
@@ -404,6 +488,8 @@ class Monitor:
         if not ms:
             self._emit_error(name, "session not found")
             return
+
+        ms._last_active = time.monotonic()
 
         if not await ms.tmux.is_alive():
             ms.state = SessionState.DEAD
@@ -592,6 +678,32 @@ class Monitor:
                     prev_state = new_state
                     ms.state = new_state
 
+                # Track last active time for idle reaping
+                if new_state != SessionState.IDLE or ms.observing:
+                    ms._last_active = now
+
+                # Idle reaping: kill sessions idle too long, store for --resume
+                if (not ms.observing and
+                        new_state == SessionState.IDLE and
+                        (now - ms._last_active) > IDLE_REAP_TIMEOUT):
+                    session_id = None
+                    if ms._jsonl_watcher:
+                        session_id = ms._jsonl_watcher.get_session_id()
+                    self._reaped_sessions[ms.name] = {
+                        "session_id": session_id,
+                        "working_dir": ms.working_dir,
+                    }
+                    log.info(
+                        f"[{ms.name}] Reaping idle session "
+                        f"(idle {now - ms._last_active:.0f}s, "
+                        f"resume_id={session_id})"
+                    )
+                    await ms.tmux.kill()
+                    self._emit({"session": ms.name, "event": "reaped",
+                                 "resume_session_id": session_id})
+                    del self.sessions[ms.name]
+                    break
+
                 # Auto-observe: detect organic interaction (direct tmux typing).
                 # Runs every poll, not just on transitions — if we miss the exact
                 # IDLE→THINKING edge, steady-state detection still catches it.
@@ -630,13 +742,30 @@ class Monitor:
                             self._emit(tool_evt)
                             last_response_change = now
 
-                    # Completion: back to idle with content
-                    if ms._yielded and new_state == SessionState.IDLE:
-                        self._emit({"session": ms.name, "event": "complete",
-                                     "total_length": len(ms._yielded)})
-                        ms.observing = False
-                        last_observe_complete = now
-                        log.info(f"[{ms.name}] Response complete ({len(ms._yielded)} chars)")
+                    # Completion: back to idle with content (or after
+                    # retry — TUI may not have rendered final text yet)
+                    if new_state == SessionState.IDLE:
+                        if not ms._yielded:
+                            # One retry: TUI might still be rendering
+                            await asyncio.sleep(0.5)
+                            full_capture = await ms.tmux.capture_pane()
+                            response = ms.parser.extract_new_response(
+                                ms._baseline_count, full_capture)
+                            if response:
+                                self._emit({"session": ms.name,
+                                             "event": "chunk", "text": response})
+                                ms._yielded = response
+                        if ms._yielded:
+                            self._emit({"session": ms.name, "event": "complete",
+                                         "total_length": len(ms._yielded)})
+                            ms.observing = False
+                            last_observe_complete = now
+                            log.info(f"[{ms.name}] Response complete ({len(ms._yielded)} chars)")
+                            if ms._jsonl_watcher:
+                                meta = ms._jsonl_watcher.get_turn_metadata()
+                                if meta:
+                                    self._emit({"session": ms.name,
+                                                 "event": "metadata", **meta})
 
                     # Quiescence: response stopped growing
                     elif (ms._yielded and
@@ -648,6 +777,11 @@ class Monitor:
                         ms.observing = False
                         last_observe_complete = now
                         log.info(f"[{ms.name}] Response complete (quiescence)")
+                        if ms._jsonl_watcher:
+                            meta = ms._jsonl_watcher.get_turn_metadata()
+                            if meta:
+                                self._emit({"session": ms.name,
+                                             "event": "metadata", **meta})
 
                     # No progress timeout
                     elif (not ms._yielded and
