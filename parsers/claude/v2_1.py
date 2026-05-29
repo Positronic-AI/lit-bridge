@@ -124,7 +124,7 @@ class ClaudeV21Parser(TUIParser):
         while content_lines:
             s = content_lines[-1].strip()
             if (not s or self.RE_CONVERSATION_PICKER.match(s) or
-                    self.RE_SEPARATOR.match(s) or self.RE_USER.match(s) or
+                    self.RE_SEPARATOR.match(s) or s.startswith('❯') or
                     self.RE_STATUS.match(s)):
                 content_lines.pop()
             else:
@@ -318,7 +318,7 @@ class ClaudeV21Parser(TUIParser):
             s = lines[content_end - 1].strip()
             if (not s or
                     self.RE_SEPARATOR.match(s) or
-                    self.RE_USER.match(s) or
+                    s.startswith('❯') or
                     self.RE_SPINNER_ACTIVE.match(s) or
                     self.RE_STATUS.match(s) or
                     self.RE_TOKEN_STATS.search(s) or

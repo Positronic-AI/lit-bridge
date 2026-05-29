@@ -416,6 +416,22 @@ class TestEdgeCases(unittest.TestCase):
         self.assertNotIn("↑/↓ to select", response)
         self.assertNotIn("○ Plan", response)
 
+    def test_bare_prompt_and_separator_stripped_from_raw_response(self):
+        """Bare ❯ prompt and separator must not leak into streamed content."""
+        capture = """
+❯ hello
+
+● Here is my response so far and it keeps going
+
+────────────────────────────────────────────
+❯
+  ⏵⏵ bypass permissions on · ← for agents
+"""
+        response = self.parser.extract_raw_response(0, capture)
+        self.assertNotIn('────', response)
+        self.assertNotIn('❯', response)
+        self.assertIn('Here is my response', response)
+
     def test_conversation_picker_doesnt_cause_false_responding(self):
         """● in conversation picker must not trigger RESPONDING state."""
         capture = """
