@@ -28,6 +28,13 @@ class TUIMessage:
 
 
 @dataclass
+class TUIContentBlock:
+    type: str       # "text", "tool_call", "tool_output"
+    content: str
+    tool_name: Optional[str] = None
+
+
+@dataclass
 class TUIState:
     state: SessionState
     messages: List[TUIMessage] = field(default_factory=list)
@@ -48,12 +55,25 @@ class TUIParser(ABC):
         """Extract all user/assistant message pairs from the capture."""
 
     @abstractmethod
+    def extract_content_blocks(self, capture: str) -> List['TUIContentBlock']:
+        """Extract ordered content blocks (text, tool calls, tool output) from the capture."""
+
+    @abstractmethod
     def count_assistant_messages(self, capture: str) -> int:
         """Count assistant response blocks in the capture."""
 
     @abstractmethod
     def extract_new_response(self, baseline_count: int, capture: str) -> str:
         """Get the latest assistant response if one appeared after baseline_count."""
+
+    def extract_raw_response(self, baseline_count: int, capture: str) -> str:
+        """Get raw terminal content for new response(s) after baseline_count.
+
+        Unlike extract_new_response(), this captures everything between the
+        response start and completion marker with no filtering.  The result
+        is the faithful terminal content the user would see.
+        """
+        return self.extract_new_response(baseline_count, capture)
 
     @abstractmethod
     def is_startup_dialog(self, capture: str) -> Optional[Tuple[str, List[str], str]]:

@@ -6,7 +6,7 @@ Run: python3 test_parser.py
 """
 
 import unittest
-from parsers.claude import ClaudeTUIParser
+from parsers.claude import ClaudeV21Parser
 from parsers.base import SessionState
 
 
@@ -14,7 +14,7 @@ class TestDetectState(unittest.TestCase):
     """Test state detection from TUI captures."""
 
     def setUp(self):
-        self.parser = ClaudeTUIParser()
+        self.parser = ClaudeV21Parser()
 
     def test_empty_is_dead(self):
         self.assertEqual(self.parser.detect_state(""), SessionState.DEAD)
@@ -95,12 +95,46 @@ Esc to cancel
 """
         self.assertEqual(self.parser.detect_state(capture), SessionState.THINKING)
 
+    def test_active_spinner_is_thinking_not_idle(self):
+        """In-progress ✻ with ellipsis must NOT be detected as IDLE."""
+        capture = """
+● Reading 1 file… (ctrl+o to expand)
+  └ .lit/CLAUDE.md
+
+✻ Accomplishing… (3s · ↓ 8 tokens)
+────────────────────────────────────────────
+❯
+  ⏵⏵ bypass permissions on · ← for agents
+"""
+        self.assertEqual(self.parser.detect_state(capture), SessionState.THINKING)
+
+    def test_completed_spinner_is_idle(self):
+        """Completed ✻ without ellipsis is proper IDLE."""
+        capture = """
+● Here is my response.
+
+✻ Brewed for 9s
+────────────────────────────────────────────
+❯
+  ⏵⏵ bypass permissions on · ← for agents
+"""
+        self.assertEqual(self.parser.detect_state(capture), SessionState.IDLE)
+
+    def test_completed_duration_only_is_idle(self):
+        """Short ✻ duration marker is proper IDLE."""
+        capture = """
+● Done!
+
+✻ 2.3s
+"""
+        self.assertEqual(self.parser.detect_state(capture), SessionState.IDLE)
+
 
 class TestExtractMessages(unittest.TestCase):
     """Test message extraction from TUI captures."""
 
     def setUp(self):
-        self.parser = ClaudeTUIParser()
+        self.parser = ClaudeV21Parser()
 
     def test_single_exchange(self):
         capture = """
@@ -194,7 +228,7 @@ class TestExtractMessages(unittest.TestCase):
 class TestCountAssistant(unittest.TestCase):
 
     def setUp(self):
-        self.parser = ClaudeTUIParser()
+        self.parser = ClaudeV21Parser()
 
     def test_zero_messages(self):
         self.assertEqual(self.parser.count_assistant_messages("❯ hello"), 0)
@@ -218,7 +252,7 @@ class TestCountAssistant(unittest.TestCase):
 class TestExtractNewResponse(unittest.TestCase):
 
     def setUp(self):
-        self.parser = ClaudeTUIParser()
+        self.parser = ClaudeV21Parser()
 
     def test_new_response_after_baseline(self):
         capture = """
@@ -252,7 +286,7 @@ class TestExtractNewResponse(unittest.TestCase):
 class TestStartupDialogs(unittest.TestCase):
 
     def setUp(self):
-        self.parser = ClaudeTUIParser()
+        self.parser = ClaudeV21Parser()
 
     def test_trust_dialog(self):
         capture = """
@@ -287,7 +321,7 @@ class TestStartupDialogs(unittest.TestCase):
 class TestParse(unittest.TestCase):
 
     def setUp(self):
-        self.parser = ClaudeTUIParser()
+        self.parser = ClaudeV21Parser()
 
     def test_parse_with_version(self):
         capture = """
@@ -329,7 +363,7 @@ class TestEdgeCases(unittest.TestCase):
     """Edge cases and regressions."""
 
     def setUp(self):
-        self.parser = ClaudeTUIParser()
+        self.parser = ClaudeV21Parser()
 
     def test_scrollback_dialog_doesnt_poison_state(self):
         """The bug we fixed: old dialog text in scrollback caused false DIALOG state."""

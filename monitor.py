@@ -810,9 +810,14 @@ class Monitor:
                             turn_confirmed = not re.search(r'✻\s+.*…', after)
 
                     if response != ms._yielded:
-                        self._emit({"session": ms.name, "event": "replace",
-                                     "text": response,
-                                     "organic": ms._is_organic})
+                        evt = {"session": ms.name, "event": "replace",
+                               "text": response,
+                               "organic": ms._is_organic}
+                        if ms.channel_id:
+                            evt["channel_id"] = ms.channel_id
+                        if ms.team:
+                            evt["team"] = ms.team
+                        self._emit(evt)
                         ms._yielded = response
                         last_response_change = now
 

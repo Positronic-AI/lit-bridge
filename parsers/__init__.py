@@ -1,4 +1,12 @@
 from .base import TUIParser, TUIMessage, SessionState
-from .claude import ClaudeTUIParser
+from .claude import ClaudeV21Parser
+from .registry import select_parser, register, supported_clis
 
-__all__ = ["TUIParser", "TUIMessage", "SessionState", "ClaudeTUIParser"]
+# Backward compat — monitor.py imports this name
+ClaudeTUIParser = ClaudeV21Parser
+
+__all__ = [
+    "TUIParser", "TUIMessage", "SessionState",
+    "ClaudeTUIParser", "ClaudeV21Parser",
+    "select_parser", "register", "supported_clis",
+]
