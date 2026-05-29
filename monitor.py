@@ -46,8 +46,9 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from tmux_session import TmuxSession, sanitize_name
-from parsers import SessionState, ClaudeTUIParser
+from parsers import SessionState
 from parsers.base import TUIParser
+from parsers.registry import select_parser
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,14 +60,13 @@ log = logging.getLogger("lit-monitor")
 POLL_INTERVAL = 0.3
 STARTUP_WAIT = 3.0
 QUIESCENCE_TIMEOUT = 5.0
+QUIESCENCE_UNCONFIRMED_TIMEOUT = 30.0
+COMPLETION_DEBOUNCE = 2.0  # require stable IDLE+confirmed for 2s before firing
 AUTO_OBSERVE_COOLDOWN = 1.5
-NO_PROGRESS_TIMEOUT = 30.0
-IDLE_REAP_TIMEOUT = 600.0  # 10 minutes idle → kill session, resumable
+NO_PROGRESS_TIMEOUT = 90.0
+IDLE_REAP_TIMEOUT = 3600.0  # 1 hour idle → kill session, resumable
 EVENT_BUFFER_MAX = 500
 
-PARSERS = {
-    "claude-code": ClaudeTUIParser,
-}
 
 CLI_DEFAULTS = {
     "claude": "claude",
@@ -294,11 +294,15 @@ class JsonlWatcher:
         """Read the JSONL backwards to find the most recent user text message."""
         f = self._file or self._find_active_jsonl()
         if not f or not f.exists():
+            log.info(f"get_last_user_message: no file (file={self._file})")
             return None
+        log.info(f"get_last_user_message: reading {f.name} ({f.stat().st_size} bytes)")
         try:
             lines = f.read_text(encoding='utf-8', errors='replace').strip().split('\n')
-        except OSError:
+        except OSError as e:
+            log.info(f"get_last_user_message: OSError {e}")
             return None
+        user_count = 0
         for line in reversed(lines):
             try:
                 entry = json.loads(line)
@@ -306,16 +310,22 @@ class JsonlWatcher:
                 continue
             if entry.get('type') not in ('human', 'user'):
                 continue
+            user_count += 1
             msg = entry.get('message', {})
             content = msg.get('content', '')
             if isinstance(content, str) and content.strip():
+                log.info(f"get_last_user_message: found at user#{user_count}: {content.strip()[:80]!r}")
                 return content.strip()
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get('type') == 'text':
                         text = block.get('text', '').strip()
                         if text:
+                            log.info(f"get_last_user_message: found block at user#{user_count}: {text[:80]!r}")
                             return text
+            if user_count >= 3:
+                break
+        log.info(f"get_last_user_message: no text user message found in {user_count} user entries")
         return None
 
 
@@ -323,13 +333,17 @@ class ManagedSession:
     """A tmux session + its parser + observer state."""
 
     def __init__(self, name: str, tmux: TmuxSession, parser: TUIParser,
-                 working_dir: str = None):
+                 working_dir: str = None, channel_id: str = None,
+                 team: str = None):
         self.name = name
         self.tmux = tmux
         self.parser = parser
         self.working_dir = working_dir
+        self.channel_id = channel_id
+        self.team = team
         self.state = SessionState.STARTING
         self.observing = False
+        self._is_organic = False
         self._observe_task: Optional[asyncio.Task] = None
         self._jsonl_watcher: Optional[JsonlWatcher] = None
         self._claude_session_id: Optional[str] = None
@@ -403,13 +417,20 @@ class Monitor:
         if name in self.sessions:
             ms = self.sessions[name]
             if await ms.tmux.is_alive():
+                channel_id = cmd.get("channel_id")
+                team = cmd.get("team")
+                if channel_id and not ms.channel_id:
+                    ms.channel_id = channel_id
+                    ms.team = team
+                    win_label = f"{team}:{channel_id}" if team else channel_id
+                    await ms.tmux.rename_window(win_label)
                 self._emit({"session": name, "event": "ready", "reused": True})
                 return
             del self.sessions[name]
 
         parser_name = cmd.get("parser", "claude-code")
-        parser_cls = PARSERS.get(parser_name)
-        if not parser_cls:
+        parser = select_parser(parser_name)
+        if not parser:
             self._emit_error(name, f"unknown parser: {parser_name}")
             return
 
@@ -422,6 +443,8 @@ class Monitor:
 
         cli_args = list(cmd.get("args", []))
         working_dir = cmd.get("working_dir")
+        channel_id = cmd.get("channel_id")
+        team = cmd.get("team")
         env_vars = cmd.get("env", {})
 
         # Resume from a previously reaped idle session
@@ -433,7 +456,6 @@ class Monitor:
         full_cmd = [cli_path] + cli_args
 
         tmux = TmuxSession(sanitize_name(name))
-        parser = parser_cls()
 
         log.info(f"Creating session '{name}': {' '.join(full_cmd)}")
 
@@ -443,8 +465,13 @@ class Monitor:
             self._emit_error(name, f"spawn failed: {e}")
             return
 
-        ms = ManagedSession(name, tmux, parser, working_dir=working_dir)
+        ms = ManagedSession(name, tmux, parser, working_dir=working_dir,
+                            channel_id=channel_id, team=team)
         self.sessions[name] = ms
+
+        if channel_id:
+            win_label = f"{team}:{channel_id}" if team else channel_id
+            await tmux.rename_window(win_label)
 
         await asyncio.sleep(STARTUP_WAIT)
 
@@ -540,7 +567,15 @@ class Monitor:
         # Response observation is handled by _observe_loop
         # Store baseline so the observer knows when new content appears
         ms._baseline_count = baseline_count
+        ms._sent_content = content
         ms._yielded = ""
+        blocks = ms.parser.extract_content_blocks(full_capture)
+        ms._baseline_tool_count = len(
+            [b for b in blocks if b.type in ("tool_call", "tool_output")])
+        ms._emitted_tool_count = 0
+        ms._streaming_tool_output = False
+        ms._last_tool_output_content = ""
+        ms._is_organic = False
         ms.observing = True
 
     async def _cmd_input(self, cmd: dict):
@@ -637,6 +672,7 @@ class Monitor:
         last_response_change = time.monotonic()
         last_capture_change = time.monotonic()
         last_observe_complete = time.monotonic()
+        idle_confirmed_since = 0.0  # when IDLE+confirmed was first seen
         prev_capture = ""
         poll_count = 0
 
@@ -665,6 +701,16 @@ class Monitor:
                     prev_capture = visible
 
                 new_state = ms.parser.detect_state(visible)
+                transitioned_from_idle = (
+                    new_state != prev_state and
+                    prev_state == SessionState.IDLE
+                )
+
+                # Verbose logging when not observing: detect missed transitions
+                if not ms.observing and poll_count % 10 == 0:
+                    last_lines = visible.strip().split('\n')[-3:] if visible else []
+                    log.info(f"[{ms.name}] poll state={new_state.value} "
+                             f"bottom={[l.strip()[:60] for l in last_lines]}")
 
                 # Log state changes for diagnostics
                 if new_state != prev_state:
@@ -705,86 +751,163 @@ class Monitor:
                     break
 
                 # Auto-observe: detect organic interaction (direct tmux typing).
-                # Runs every poll, not just on transitions — if we miss the exact
-                # IDLE→THINKING edge, steady-state detection still catches it.
+                # Only triggers on a fresh IDLE→active transition — prevents
+                # re-observe loops when residual TUI state looks non-idle after
+                # a quiescence completion.
                 if (not ms.observing and
+                        transitioned_from_idle and
                         new_state in (SessionState.THINKING, SessionState.RESPONDING) and
                         (now - last_observe_complete) > AUTO_OBSERVE_COOLDOWN):
                     full_capture = await ms.tmux.capture_pane()
                     ms._baseline_count = ms.parser.count_assistant_messages(full_capture)
                     ms._yielded = ""
+                    blocks = ms.parser.extract_content_blocks(full_capture)
+                    ms._baseline_tool_count = len(
+                        [b for b in blocks
+                         if b.type in ("tool_call", "tool_output")])
+                    ms._emitted_tool_count = 0
+                    ms._streaming_tool_output = False
+                    ms._last_tool_output_content = ""
                     if ms._jsonl_watcher:
                         user_msg = ms._jsonl_watcher.get_last_user_message()
+                        log.info(f"[{ms.name}] Organic user_input lookup: {user_msg!r}")
                         if user_msg:
-                            self._emit({"session": ms.name, "event": "user_input",
-                                         "text": user_msg})
+                            evt = {"session": ms.name, "event": "user_input",
+                                   "text": user_msg, "organic": True}
+                            if ms.channel_id:
+                                evt["channel_id"] = ms.channel_id
+                            if ms.team:
+                                evt["team"] = ms.team
+                            self._emit(evt)
                         ms._jsonl_watcher.begin_turn()
+                    else:
+                        log.info(f"[{ms.name}] No JSONL watcher for organic input")
+                    ms._is_organic = True
                     ms.observing = True
                     log.info(f"[{ms.name}] Auto-observing organic interaction")
 
-                # Emit response chunks when actively observing
+                # Emit response content when actively observing
+                # Full/replace model: emit the complete current response
+                # each poll.  The frontend replaces (not appends) its
+                # display, so the content is always the current truth.
                 if ms.observing and hasattr(ms, '_baseline_count'):
                     full_capture = await ms.tmux.capture_pane()
-                    response = ms.parser.extract_new_response(
-                        ms._baseline_count, full_capture)
+                    response = ms.parser.extract_raw_response(
+                        ms._baseline_count, full_capture,
+                        sent_content=getattr(ms, '_sent_content', None))
 
-                    if len(response) > len(ms._yielded):
-                        new_text = response[len(ms._yielded):]
-                        self._emit({"session": ms.name, "event": "chunk",
-                                     "text": new_text})
+                    # Detect definitive turn completion: a completed ✻
+                    # marker (e.g. "✻ Brewed for 9s") after the last ●
+                    # block means the CLI's entire turn is done.
+                    # In-progress spinners ("✻ Accomplishing…") do NOT
+                    # count — they appear mid-tool-use and cause premature
+                    # completion if treated as done.
+                    last_bullet = full_capture.rfind('●')
+                    turn_confirmed = False
+                    if last_bullet >= 0:
+                        after = full_capture[last_bullet:]
+                        if '✻' in after:
+                            turn_confirmed = not re.search(r'✻\s+.*…', after)
+
+                    if response != ms._yielded:
+                        self._emit({"session": ms.name, "event": "replace",
+                                     "text": response,
+                                     "organic": ms._is_organic})
                         ms._yielded = response
                         last_response_change = now
 
-                    # Emit structured tool events from JSONL
+                    # JSONL watcher: drain events, keep metadata
                     if ms._jsonl_watcher:
                         for tool_evt in ms._jsonl_watcher.poll():
+                            if tool_evt.get("event") in (
+                                    "tool_use", "tool_result"):
+                                continue
                             tool_evt["session"] = ms.name
                             self._emit(tool_evt)
                             last_response_change = now
 
-                    # Completion: back to idle with content (or after
-                    # retry — TUI may not have rendered final text yet)
-                    if new_state == SessionState.IDLE:
-                        if not ms._yielded:
-                            # One retry: TUI might still be rendering
-                            await asyncio.sleep(0.5)
-                            full_capture = await ms.tmux.capture_pane()
-                            response = ms.parser.extract_new_response(
-                                ms._baseline_count, full_capture)
-                            if response:
+                    # Completion: idle + ✻ marker confirmed + debounce.
+                    # The CLI flickers between IDLE and RESPONDING during
+                    # tool calls — a single IDLE+confirmed snapshot is not
+                    # reliable.  Require the condition to hold for 2s.
+                    if new_state == SessionState.IDLE and turn_confirmed:
+                        if idle_confirmed_since == 0.0:
+                            idle_confirmed_since = now
+                        if (now - idle_confirmed_since) >= COMPLETION_DEBOUNCE:
+                            if not ms._yielded:
+                                await asyncio.sleep(0.5)
+                                full_capture = await ms.tmux.capture_pane()
+                                response = ms.parser.extract_raw_response(
+                                    ms._baseline_count, full_capture,
+                                    sent_content=getattr(ms, '_sent_content', None))
+                                if response:
+                                    self._emit({"session": ms.name,
+                                                 "event": "replace",
+                                                 "text": response})
+                                    ms._yielded = response
+                            if ms._yielded:
+                                evt = {"session": ms.name,
+                                       "event": "complete",
+                                       "total_length": len(ms._yielded),
+                                       "content": ms._yielded,
+                                       "organic": ms._is_organic}
+                                if ms.channel_id:
+                                    evt["channel_id"] = ms.channel_id
+                                if ms.team:
+                                    evt["team"] = ms.team
+                                self._emit(evt)
+                                ms.observing = False
+                                idle_confirmed_since = 0.0
+                                last_observe_complete = now
+                                log.info(f"[{ms.name}] Response complete ({len(ms._yielded)} chars)")
+                                if ms._jsonl_watcher:
+                                    meta = ms._jsonl_watcher.get_turn_metadata()
+                                    if meta:
+                                        self._emit({"session": ms.name,
+                                                     "event": "metadata", **meta})
+                    else:
+                        idle_confirmed_since = 0.0
+
+                    # Quiescence fallback: response stopped growing.
+                    # Use short timeout if ✻ confirmed (normal completion
+                    # the IDLE check somehow missed), long timeout otherwise
+                    # (tool calls can stall response text for 10-20s).
+                    if ms._yielded and ms.observing:
+                        q_timeout = (QUIESCENCE_TIMEOUT if turn_confirmed
+                                     else QUIESCENCE_UNCONFIRMED_TIMEOUT)
+                        if ((now - last_response_change) > q_timeout and
+                                new_state in (SessionState.IDLE,
+                                              SessionState.RESPONDING)):
+                            if getattr(ms, '_streaming_tool_output', False):
                                 self._emit({"session": ms.name,
-                                             "event": "chunk", "text": response})
-                                ms._yielded = response
-                        if ms._yielded:
-                            self._emit({"session": ms.name, "event": "complete",
-                                         "total_length": len(ms._yielded)})
+                                             "event": "tool_result_done"})
+                                ms._streaming_tool_output = False
+                            q_evt = {"session": ms.name, "event": "complete",
+                                    "total_length": len(ms._yielded),
+                                    "content": ms._yielded,
+                                    "reason": "quiescence",
+                                    "organic": ms._is_organic}
+                            if ms.channel_id:
+                                q_evt["channel_id"] = ms.channel_id
+                            if ms.team:
+                                q_evt["team"] = ms.team
+                            self._emit(q_evt)
                             ms.observing = False
-                            last_observe_complete = now
-                            log.info(f"[{ms.name}] Response complete ({len(ms._yielded)} chars)")
+                            # Longer cooldown after quiescence — the TUI state
+                            # may still flicker, causing false re-triggers.
+                            last_observe_complete = now + 15.0
+                            log.info(f"[{ms.name}] Response complete "
+                                     f"(quiescence, confirmed={turn_confirmed})")
                             if ms._jsonl_watcher:
                                 meta = ms._jsonl_watcher.get_turn_metadata()
                                 if meta:
                                     self._emit({"session": ms.name,
                                                  "event": "metadata", **meta})
 
-                    # Quiescence: response stopped growing
-                    elif (ms._yielded and
-                            (now - last_response_change) > QUIESCENCE_TIMEOUT and
-                            new_state in (SessionState.IDLE, SessionState.RESPONDING)):
-                        self._emit({"session": ms.name, "event": "complete",
-                                     "total_length": len(ms._yielded),
-                                     "reason": "quiescence"})
-                        ms.observing = False
-                        last_observe_complete = now
-                        log.info(f"[{ms.name}] Response complete (quiescence)")
-                        if ms._jsonl_watcher:
-                            meta = ms._jsonl_watcher.get_turn_metadata()
-                            if meta:
-                                self._emit({"session": ms.name,
-                                             "event": "metadata", **meta})
-
-                    # No progress timeout
+                    # No progress timeout — but not while the CLI is
+                    # actively thinking (loading context can take 60s+)
                     elif (not ms._yielded and
+                            new_state != SessionState.THINKING and
                             (now - last_capture_change) > NO_PROGRESS_TIMEOUT):
                         self._emit({"session": ms.name, "event": "error",
                                      "message": "no progress timeout"})
@@ -958,19 +1081,31 @@ class Monitor:
 
             tmux = TmuxSession(session_name)
             tmux._alive = True
-            parser = ClaudeTUIParser()
+            parser = select_parser("claude-code")
 
             visible = await tmux.capture_pane(visible_only=True)
             if not visible.strip():
                 continue
 
-            ms = ManagedSession(session_name, tmux, parser)
+            win_name = await tmux.get_window_name()
+            channel_id = None
+            team = None
+            if win_name and win_name not in CLI_DEFAULTS:
+                if ':' in win_name:
+                    team, channel_id = win_name.split(':', 1)
+                else:
+                    channel_id = win_name
+            working_dir = await tmux.get_pane_cwd() or None
+            ms = ManagedSession(session_name, tmux, parser,
+                                working_dir=working_dir,
+                                channel_id=channel_id, team=team)
             ms.state = parser.detect_state(visible)
             ms._observe_task = asyncio.create_task(self._observe_loop(ms))
             self.sessions[session_name] = ms
 
             log.info(f"Discovered existing session: {session_name} "
-                     f"(state={ms.state.value})")
+                     f"(state={ms.state.value} channel={channel_id} team={team} "
+                     f"working_dir={working_dir})")
 
     async def _shutdown(self):
         log.info(f"Shutting down ({len(self.sessions)} sessions still running)")
@@ -981,11 +1116,32 @@ class Monitor:
         self._emit({"event": "monitor_shutdown"})
 
 
+def _run_test_parser():
+    """Run snapshot-based parser tests."""
+    tests_dir = Path(__file__).parent / "tests"
+    if not (tests_dir / "test_parsers.py").exists():
+        print("No test suite found at tests/test_parsers.py")
+        raise SystemExit(1)
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, str(tests_dir / "test_parsers.py")],
+        cwd=str(Path(__file__).parent),
+    )
+    raise SystemExit(result.returncode)
+
+
 def main():
     parser = argparse.ArgumentParser(description="lit-monitor: AI CLI session multiplexer")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("test-parser", help="Run snapshot-based parser validation tests")
+
     parser.add_argument("--socket", metavar="PATH",
                         help="Listen on a Unix domain socket (daemon mode)")
     args = parser.parse_args()
+
+    if args.command == "test-parser":
+        _run_test_parser()
+        return
 
     if args.socket:
         log_path = Path(args.socket).with_suffix('.log')

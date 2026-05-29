@@ -109,6 +109,22 @@ class TmuxSession:
         name = shlex.quote(self.session_name)
         await self._exec(f"tmux send-keys -t {name} {keys}")
 
+    async def rename_window(self, name: str):
+        sess = shlex.quote(self.session_name)
+        await self._exec(f"tmux rename-window -t {sess} {shlex.quote(name)}")
+
+    async def get_window_name(self) -> str:
+        sess = shlex.quote(self.session_name)
+        rc, stdout, _ = await self._exec(
+            f"tmux display-message -t {sess} -p '#W'")
+        return stdout.strip() if rc == 0 else ""
+
+    async def get_pane_cwd(self) -> str:
+        sess = shlex.quote(self.session_name)
+        rc, stdout, _ = await self._exec(
+            f"tmux display-message -t {sess} -p '#{{pane_current_path}}'")
+        return stdout.strip() if rc == 0 else ""
+
     async def is_alive(self) -> bool:
         cmd = f"tmux has-session -t {shlex.quote(self.session_name)}"
         rc, _, _ = await self._exec(cmd)
