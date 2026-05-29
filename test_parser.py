@@ -87,13 +87,14 @@ Esc to cancel
 """
         self.assertEqual(self.parser.detect_state(capture), SessionState.DIALOG)
 
-    def test_thinking_user_input_no_response(self):
+    def test_prompt_with_no_spinner_is_idle(self):
+        """Prompt visible with no thinking spinner — can't distinguish from awaiting input."""
         capture = """
 ❯ what is 2+2?
 
 
 """
-        self.assertEqual(self.parser.detect_state(capture), SessionState.THINKING)
+        self.assertEqual(self.parser.detect_state(capture), SessionState.IDLE)
 
     def test_active_spinner_is_thinking_not_idle(self):
         """In-progress ✻ with ellipsis must NOT be detected as IDLE."""
@@ -392,6 +393,42 @@ class TestEdgeCases(unittest.TestCase):
         self.assertEqual(len(msgs), 2)
         self.assertIn("你好", msgs[1].content)
         self.assertIn("🎉", msgs[1].content)
+
+    def test_conversation_picker_doesnt_poison_bullet_count(self):
+        """● in conversation picker must not be counted as an assistant bullet."""
+        capture = """
+❯ plan organic streaming
+
+● Plan(Plan organic streaming)
+  ⎿ Read(stream_buffer.py)
+    Bash(grep -n "stream_buffer_manager" server.py)
+    Running...
+  × 32 tool uses (ctrl+o to expand)
+
+✻ Schlepping… (4m 38s · ↓ 6.0k tokens)
+────────────────────────────────────────────
+❯
+  ⏵⏵ bypass permissions on · ← for agents
+● main            ↑/↓ to select · Enter to view
+○ Plan  Plan organic streaming     4m 31s
+"""
+        response = self.parser.extract_raw_response(0, capture)
+        self.assertNotIn("↑/↓ to select", response)
+        self.assertNotIn("○ Plan", response)
+
+    def test_conversation_picker_doesnt_cause_false_responding(self):
+        """● in conversation picker must not trigger RESPONDING state."""
+        capture = """
+● Here is my response.
+
+✻ Brewed for 9s
+────────────────────────────────────────────
+❯
+  ⏵⏵ bypass permissions on · ← for agents
+● main            ↑/↓ to select · Enter to view
+○ Plan  Plan organic streaming     4m 31s
+"""
+        self.assertEqual(self.parser.detect_state(capture), SessionState.IDLE)
 
     def test_response_with_code_block(self):
         capture = """

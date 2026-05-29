@@ -31,6 +31,7 @@ class ClaudeV21Parser(TUIParser):
     RE_TOOL_HEADER = re.compile(r'^\s*●\s+(Reading|Writing|Editing|Running|Searching|Listing)\s')
     RE_TOOL_CALL_START = re.compile(r'^([A-Z]\w*)\(')
     RE_TOKEN_STATS = re.compile(r'\(.*?[↓↑]\s*\d+\s*tokens?.*?\)')
+    RE_CONVERSATION_PICKER = re.compile(r'^\s*[●○]\s+\S.*(?:↑/↓|to select|Enter to view|\d+[ms]\d*s?)\s*$')
 
     DIALOG_STRINGS = [
         "Enter to confirm",
@@ -118,9 +119,20 @@ class ClaudeV21Parser(TUIParser):
                 return SessionState.THINKING
             break
 
-        last_bullet = capture.rfind('●')
+        # Strip conversation picker before checking for active response
+        content_lines = capture.split('\n')
+        while content_lines:
+            s = content_lines[-1].strip()
+            if (not s or self.RE_CONVERSATION_PICKER.match(s) or
+                    self.RE_SEPARATOR.match(s) or self.RE_USER.match(s) or
+                    self.RE_STATUS.match(s)):
+                content_lines.pop()
+            else:
+                break
+        content_area = '\n'.join(content_lines)
+        last_bullet = content_area.rfind('●')
         if last_bullet >= 0:
-            after = capture[last_bullet:]
+            after = content_area[last_bullet:]
             if '✻' not in after and '✽' not in after:
                 return SessionState.RESPONDING
 
@@ -296,11 +308,31 @@ class ClaudeV21Parser(TUIParser):
         locating the sent message text as a landmark.
         """
         lines = capture.split('\n')
+
+        # Trim bottom panel first — separator, prompt, status bar, and
+        # conversation picker all live below the content area.  Removing
+        # them before bullet-counting prevents the picker's ● (e.g.
+        # "● main") from being mistaken for an assistant response bullet.
+        content_end = len(lines)
+        while content_end > 0:
+            s = lines[content_end - 1].strip()
+            if (not s or
+                    self.RE_SEPARATOR.match(s) or
+                    self.RE_USER.match(s) or
+                    self.RE_SPINNER_ACTIVE.match(s) or
+                    self.RE_STATUS.match(s) or
+                    self.RE_TOKEN_STATS.search(s) or
+                    self.RE_CONVERSATION_PICKER.match(s) or
+                    'Claude Code' in s):
+                content_end -= 1
+            else:
+                break
+
         bullet_count = 0
         start_idx = None
-        end_idx = len(lines)
+        end_idx = content_end
 
-        for i, line in enumerate(lines):
+        for i, line in enumerate(lines[:content_end]):
             if self.RE_RESPONSE.match(line.strip()):
                 bullet_count += 1
                 if bullet_count == baseline_count + 1 and start_idx is None:
@@ -315,38 +347,24 @@ class ClaudeV21Parser(TUIParser):
         if start_idx is None and bullet_count < baseline_count and sent_content:
             needle = sent_content.strip().split('\n')[0][:80]
             sent_line_idx = None
-            for i, line in enumerate(lines):
+            for i, line in enumerate(lines[:content_end]):
                 if needle and needle in line:
                     sent_line_idx = i
                     break
             if sent_line_idx is not None:
-                for i in range(sent_line_idx + 1, len(lines)):
+                for i in range(sent_line_idx + 1, content_end):
                     if self.RE_RESPONSE.match(lines[i].strip()):
                         start_idx = i
                         break
                 if start_idx is not None:
-                    end_idx = len(lines)
-                    for i in range(start_idx + 1, len(lines)):
+                    end_idx = content_end
+                    for i in range(start_idx + 1, content_end):
                         if self.RE_COMPLETION.match(lines[i].strip()):
                             end_idx = i + 1
                             break
 
         if start_idx is None:
             return ""
-
-        # Strip trailing TUI chrome that changes every poll
-        while end_idx > start_idx:
-            s = lines[end_idx - 1].strip()
-            if (not s or
-                    self.RE_SEPARATOR.match(s) or
-                    self.RE_USER.match(s) or
-                    self.RE_SPINNER_ACTIVE.match(s) or
-                    self.RE_STATUS.match(s) or
-                    self.RE_TOKEN_STATS.search(s) or
-                    'Claude Code' in s):
-                end_idx -= 1
-            else:
-                break
 
         return '\n'.join(lines[start_idx:end_idx]).rstrip()
 
