@@ -21,12 +21,19 @@ def sanitize_name(s: str) -> str:
 
 class TmuxSession:
 
-    def __init__(self, session_name: str):
+    def __init__(self, session_name: str, window_name: str = None):
         self.session_name = session_name
+        self.window_name = window_name
         self.created_at = time.monotonic()
         self.last_used = time.monotonic()
         self.message_count = 0
         self._alive = False
+
+    @property
+    def _target(self) -> str:
+        if self.window_name:
+            return f"{self.session_name}:{self.window_name}"
+        return self.session_name
 
     def touch(self):
         self.last_used = time.monotonic()
@@ -46,6 +53,11 @@ class TmuxSession:
                 stdout.decode('utf-8', errors='replace'),
                 stderr.decode('utf-8', errors='replace'))
 
+    async def session_exists(self) -> bool:
+        cmd = f"tmux has-session -t {shlex.quote(self.session_name)}"
+        rc, _, _ = await self._exec(cmd)
+        return rc == 0
+
     async def spawn(self, cmd: list, env_vars: dict = None,
                     working_dir: str = None):
         tmux_args = [
@@ -54,6 +66,8 @@ class TmuxSession:
             "-x", str(TMUX_WIDTH),
             "-y", str(TMUX_HEIGHT),
         ]
+        if self.window_name:
+            tmux_args.extend(["-n", self.window_name])
         if working_dir:
             tmux_args.extend(["-c", working_dir])
         for k, v in (env_vars or {}).items():
@@ -66,6 +80,26 @@ class TmuxSession:
             raise RuntimeError(f"tmux new-session failed: {stderr.strip()}")
         self._alive = True
 
+    async def create_window(self, cmd: list, env_vars: dict = None,
+                            working_dir: str = None):
+        """Create a new window in an existing tmux session."""
+        tmux_args = [
+            "tmux", "new-window",
+            "-t", self.session_name,
+            "-n", self.window_name or "default",
+        ]
+        if working_dir:
+            tmux_args.extend(["-c", working_dir])
+        for k, v in (env_vars or {}).items():
+            tmux_args.extend(["-e", f"{k}={v}"])
+        tmux_args.extend(cmd)
+
+        tmux_cmd = " ".join(shlex.quote(a) for a in tmux_args)
+        rc, _, stderr = await self._exec(tmux_cmd)
+        if rc != 0:
+            raise RuntimeError(f"tmux new-window failed: {stderr.strip()}")
+        self._alive = True
+
     async def capture_pane(self, visible_only: bool = False) -> str:
         """Capture the tmux pane content.
 
@@ -74,11 +108,12 @@ class TmuxSession:
         Scrollback includes dismissed dialogs whose text confuses state detection.
         """
         start_flag = "-S 0" if visible_only else "-S -"
-        cmd = f"tmux capture-pane -t {shlex.quote(self.session_name)} -p {start_flag}"
+        cmd = f"tmux capture-pane -t {shlex.quote(self._target)} -p {start_flag}"
         rc, stdout, stderr = await self._exec(cmd)
         if rc != 0:
             if any(s in stderr for s in
-                   ("no server", "session not found", "can't find")):
+                   ("no server", "session not found", "can't find",
+                    "window not found")):
                 self._alive = False
             return ""
         return stdout
@@ -94,41 +129,46 @@ class TmuxSession:
         if rc != 0:
             raise RuntimeError(f"tmux load-buffer failed: {stderr}")
 
-        name = shlex.quote(self.session_name)
-        rc, _, stderr = await self._exec(f"tmux paste-buffer -t {name}")
+        target = shlex.quote(self._target)
+        rc, _, stderr = await self._exec(f"tmux paste-buffer -t {target}")
         if rc != 0:
             raise RuntimeError(f"tmux paste-buffer failed: {stderr}")
 
-        rc, _, stderr = await self._exec(f"tmux send-keys -t {name} Enter")
+        rc, _, stderr = await self._exec(f"tmux send-keys -t {target} Enter")
         if rc != 0:
             raise RuntimeError(f"tmux send-keys failed: {stderr}")
 
         self.message_count += 1
 
     async def send_keys(self, keys: str):
-        name = shlex.quote(self.session_name)
-        await self._exec(f"tmux send-keys -t {name} {keys}")
+        target = shlex.quote(self._target)
+        await self._exec(f"tmux send-keys -t {target} {keys}")
 
     async def rename_window(self, name: str):
-        sess = shlex.quote(self.session_name)
-        await self._exec(f"tmux rename-window -t {sess} {shlex.quote(name)}")
+        target = shlex.quote(self._target)
+        await self._exec(f"tmux rename-window -t {target} {shlex.quote(name)}")
 
     async def get_window_name(self) -> str:
-        sess = shlex.quote(self.session_name)
+        target = shlex.quote(self._target)
         rc, stdout, _ = await self._exec(
-            f"tmux display-message -t {sess} -p '#W'")
+            f"tmux display-message -t {target} -p '#W'")
         return stdout.strip() if rc == 0 else ""
 
     async def get_pane_cwd(self) -> str:
-        sess = shlex.quote(self.session_name)
+        target = shlex.quote(self._target)
         rc, stdout, _ = await self._exec(
-            f"tmux display-message -t {sess} -p '#{{pane_current_path}}'")
+            f"tmux display-message -t {target} -p '#{{pane_current_path}}'")
         return stdout.strip() if rc == 0 else ""
 
     async def is_alive(self) -> bool:
-        cmd = f"tmux has-session -t {shlex.quote(self.session_name)}"
-        rc, _, _ = await self._exec(cmd)
-        self._alive = (rc == 0)
+        if self.window_name:
+            cmd = f"tmux list-windows -t {shlex.quote(self.session_name)} -F '#{{window_name}}'"
+            rc, stdout, _ = await self._exec(cmd)
+            self._alive = rc == 0 and self.window_name in stdout.split('\n')
+        else:
+            cmd = f"tmux has-session -t {shlex.quote(self.session_name)}"
+            rc, _, _ = await self._exec(cmd)
+            self._alive = (rc == 0)
         return self._alive
 
     async def kill(self):

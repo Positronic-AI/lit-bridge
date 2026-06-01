@@ -408,78 +408,114 @@ class Monitor:
 
     # ── Commands ────────────────────────────────────────────
 
+    def _session_key(self, name: str, channel_id: str = None) -> str:
+        return f"{name}:{channel_id}" if channel_id else name
+
+    def _find_any_session_for(self, name: str) -> Optional['ManagedSession']:
+        """Find any existing ManagedSession whose tmux session matches name."""
+        for key, ms in self.sessions.items():
+            if key == name or key.startswith(f"{name}:"):
+                return ms
+        return None
+
     async def _cmd_create(self, cmd: dict):
         name = cmd.get("session")
         if not name:
             self._emit({"event": "error", "message": "session name required"})
             return
 
-        if name in self.sessions:
-            ms = self.sessions[name]
+        channel_id = cmd.get("channel_id")
+        team = cmd.get("team")
+        session_key = self._session_key(name, channel_id)
+
+        # Exact match — reuse existing window
+        if session_key in self.sessions:
+            ms = self.sessions[session_key]
             if await ms.tmux.is_alive():
-                channel_id = cmd.get("channel_id")
-                team = cmd.get("team")
-                if channel_id and not ms.channel_id:
-                    ms.channel_id = channel_id
-                    ms.team = team
-                    win_label = f"{team}:{channel_id}" if team else channel_id
-                    await ms.tmux.rename_window(win_label)
-                self._emit({"session": name, "event": "ready", "reused": True})
+                self._emit({"session": session_key, "event": "ready", "reused": True})
                 return
-            del self.sessions[name]
+            del self.sessions[session_key]
 
         parser_name = cmd.get("parser", "claude-code")
         parser = select_parser(parser_name)
         if not parser:
-            self._emit_error(name, f"unknown parser: {parser_name}")
+            self._emit_error(session_key, f"unknown parser: {parser_name}")
             return
 
         cli_name = cmd.get("cli", "claude")
         try:
             cli_path = find_cli(CLI_DEFAULTS.get(cli_name, cli_name))
         except FileNotFoundError as e:
-            self._emit_error(name, str(e))
+            self._emit_error(session_key, str(e))
             return
 
         cli_args = list(cmd.get("args", []))
         working_dir = cmd.get("working_dir")
-        channel_id = cmd.get("channel_id")
-        team = cmd.get("team")
         env_vars = cmd.get("env", {})
 
         # Resume from a previously reaped idle session
-        reaped = self._reaped_sessions.pop(name, None)
+        reaped = self._reaped_sessions.pop(session_key, None)
         if reaped and reaped.get("session_id"):
             cli_args.extend(["--resume", reaped["session_id"]])
-            log.info(f"[{name}] Resuming from reaped session {reaped['session_id']}")
+            log.info(f"[{session_key}] Resuming from reaped session {reaped['session_id']}")
 
         full_cmd = [cli_path] + cli_args
+        tmux_session_name = sanitize_name(name)
+        win_label = f"{team}:{channel_id}" if (team and channel_id) else (channel_id or None)
+        window_name = sanitize_name(channel_id) if channel_id else None
 
-        tmux = TmuxSession(sanitize_name(name))
-
-        log.info(f"Creating session '{name}': {' '.join(full_cmd)}")
-
-        try:
-            await tmux.spawn(full_cmd, env_vars, working_dir)
-        except RuntimeError as e:
-            self._emit_error(name, f"spawn failed: {e}")
+        # Adopt orphaned tmux window (survives monitor restarts)
+        # Windows are renamed to win_label after creation, so check that first
+        orphan_tmux = TmuxSession(tmux_session_name, window_name=win_label or window_name)
+        if await orphan_tmux.is_alive():
+            log.info(f"[{session_key}] Adopting orphaned tmux window '{orphan_tmux.window_name}' in '{tmux_session_name}'")
+            ms = ManagedSession(session_key, orphan_tmux, parser, working_dir=working_dir,
+                                channel_id=channel_id, team=team)
+            self.sessions[session_key] = ms
+            capture = await orphan_tmux.capture_pane(visible_only=True)
+            ms.state = parser.detect_state(capture)
+            ms._observe_task = asyncio.create_task(self._observe_loop(ms))
+            self._emit({"session": session_key, "event": "ready", "reused": True})
             return
 
-        ms = ManagedSession(name, tmux, parser, working_dir=working_dir,
-                            channel_id=channel_id, team=team)
-        self.sessions[name] = ms
+        # Check if the tmux session already exists (in-memory or directly)
+        existing = self._find_any_session_for(name)
+        session_probe = TmuxSession(tmux_session_name)
+        tmux_session_alive = (existing and await existing.tmux.session_exists()) or await session_probe.session_exists()
 
-        if channel_id:
-            win_label = f"{team}:{channel_id}" if team else channel_id
+        if tmux_session_alive:
+            tmux = TmuxSession(tmux_session_name, window_name=window_name)
+            log.info(f"Creating window '{window_name}' in session '{tmux_session_name}': {' '.join(full_cmd)}")
+            try:
+                await tmux.create_window(full_cmd, env_vars, working_dir)
+            except RuntimeError as e:
+                self._emit_error(session_key, f"create_window failed: {e}")
+                return
+        else:
+            tmux = TmuxSession(tmux_session_name, window_name=window_name)
+            log.info(f"Creating session '{tmux_session_name}': {' '.join(full_cmd)}")
+            try:
+                await tmux.spawn(full_cmd, env_vars, working_dir)
+            except RuntimeError as e:
+                self._emit_error(session_key, f"spawn failed: {e}")
+                return
+
+        ms = ManagedSession(session_key, tmux, parser, working_dir=working_dir,
+                            channel_id=channel_id, team=team)
+        self.sessions[session_key] = ms
+
+        if win_label:
             await tmux.rename_window(win_label)
+            tmux.window_name = win_label
 
         await asyncio.sleep(STARTUP_WAIT)
 
         # Auto-dismiss startup dialogs
         for attempt in range(5):
             if not await tmux.is_alive():
-                self._emit_error(name, "session died during startup")
-                del self.sessions[name]
+                self._emit_error(session_key, "session died during startup")
+                await tmux.kill()
+                del self.sessions[session_key]
                 return
 
             capture = await tmux.capture_pane(visible_only=True)
@@ -495,32 +531,38 @@ class Monitor:
             await asyncio.sleep(2.0)
 
         if not await tmux.is_alive():
-            self._emit_error(name, "session died after startup")
-            del self.sessions[name]
+            self._emit_error(session_key, "session died after startup")
+            await tmux.kill()
+            del self.sessions[session_key]
             return
 
         capture = await tmux.capture_pane(visible_only=True)
         ms.state = parser.detect_state(capture)
 
-        self._emit({"session": name, "event": "ready", "state": ms.state.value})
+        self._emit({"session": session_key, "event": "ready", "state": ms.state.value})
 
         # Start background observer
         ms._observe_task = asyncio.create_task(self._observe_loop(ms))
 
     async def _cmd_send(self, cmd: dict):
         name = cmd.get("session")
+        channel_id = cmd.get("channel_id")
+        session_key = self._session_key(name, channel_id)
         content = cmd.get("content", "")
 
-        ms = self.sessions.get(name)
+        ms = self.sessions.get(session_key)
+        if not ms and channel_id:
+            ms = self.sessions.get(name)
         if not ms:
-            self._emit_error(name, "session not found")
+            self._emit_error(session_key, "session not found")
             return
 
         ms._last_active = time.monotonic()
+        sk = ms.name  # use the key stored on the session for all events
 
         if not await ms.tmux.is_alive():
             ms.state = SessionState.DEAD
-            self._emit({"session": name, "event": "state",
+            self._emit({"session": sk, "event": "state",
                          "from": ms.state.value, "to": "dead"})
             return
 
@@ -530,7 +572,7 @@ class Monitor:
             current_state = ms.parser.detect_state(visible)
 
             if current_state == SessionState.DIALOG:
-                self._emit({"session": name, "event": "error",
+                self._emit({"session": sk, "event": "error",
                              "message": "session is in dialog state, use keystroke command"})
                 return
 
@@ -538,10 +580,10 @@ class Monitor:
                 break
 
             if attempt == 0:
-                log.info(f"[{name}] Waiting for idle (currently {current_state.value})")
+                log.info(f"[{sk}] Waiting for idle (currently {current_state.value})")
             await asyncio.sleep(0.5)
         else:
-            self._emit({"session": name, "event": "error",
+            self._emit({"session": sk, "event": "error",
                          "message": f"session is {current_state.value}, not ready after 10s"})
             return
 
@@ -551,21 +593,10 @@ class Monitor:
         if ms._jsonl_watcher:
             ms._jsonl_watcher.begin_turn()
 
-        log.info(f"[{name}] Sending {len(content)} chars (baseline={baseline_count})")
+        log.info(f"[{sk}] Sending {len(content)} chars (baseline={baseline_count})")
 
-        try:
-            await ms.tmux.send_message(content)
-        except RuntimeError as e:
-            self._emit_error(name, f"send failed: {e}")
-            return
-
-        old_state = ms.state
-        ms.state = SessionState.THINKING
-        self._emit({"session": name, "event": "state",
-                     "from": old_state.value, "to": "thinking"})
-
-        # Response observation is handled by _observe_loop
-        # Store baseline so the observer knows when new content appears
+        # Set observation state BEFORE sending to tmux to prevent the
+        # observe loop from racing and marking this as organic
         ms._baseline_count = baseline_count
         ms._sent_content = content
         ms._yielded = ""
@@ -577,6 +608,18 @@ class Monitor:
         ms._last_tool_output_content = ""
         ms._is_organic = False
         ms.observing = True
+
+        try:
+            await ms.tmux.send_message(content)
+        except RuntimeError as e:
+            ms.observing = False
+            self._emit_error(sk, f"send failed: {e}")
+            return
+
+        old_state = ms.state
+        ms.state = SessionState.THINKING
+        self._emit({"session": sk, "event": "state",
+                     "from": old_state.value, "to": "thinking"})
 
     async def _cmd_input(self, cmd: dict):
         """Send text to session without triggering observation.
@@ -796,18 +839,22 @@ class Monitor:
                         ms._baseline_count, full_capture,
                         sent_content=getattr(ms, '_sent_content', None))
 
-                    # Detect definitive turn completion: a completed ✻
-                    # marker (e.g. "✻ Brewed for 9s") after the last ●
-                    # block means the CLI's entire turn is done.
-                    # In-progress spinners ("✻ Accomplishing…") do NOT
-                    # count — they appear mid-tool-use and cause premature
-                    # completion if treated as done.
-                    last_bullet = full_capture.rfind('●')
+                    # Detect definitive turn completion: a line-start ✻
+                    # marker (e.g. "✻ Brewed for 9s") after the last
+                    # line-start ● block.  Must match at line start to
+                    # avoid false positives when response prose contains
+                    # these Unicode characters mid-text.
                     turn_confirmed = False
-                    if last_bullet >= 0:
-                        after = full_capture[last_bullet:]
-                        if '✻' in after:
-                            turn_confirmed = not re.search(r'✻\s+.*…', after)
+                    last_bullet_line = -1
+                    for li, ln in enumerate(full_capture.split('\n')):
+                        if re.match(r'^\s*●\s', ln):
+                            last_bullet_line = li
+                    if last_bullet_line >= 0:
+                        after_lines = full_capture.split('\n')[last_bullet_line:]
+                        for ln in after_lines:
+                            if re.match(r'^\s*✻\s', ln):
+                                turn_confirmed = not re.search(r'✻\s+.*…', ln)
+                                break
 
                     if response != ms._yielded:
                         evt = {"session": ms.name, "event": "replace",
