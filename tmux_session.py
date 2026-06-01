@@ -79,6 +79,7 @@ class TmuxSession:
         if rc != 0:
             raise RuntimeError(f"tmux new-session failed: {stderr.strip()}")
         self._alive = True
+        await self._exec(f"tmux set-option -t {shlex.quote(self.session_name)} history-limit 50000")
 
     async def create_window(self, cmd: list, env_vars: dict = None,
                             working_dir: str = None):

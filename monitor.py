@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import sys
@@ -469,6 +470,16 @@ class Monitor:
         orphan_tmux = TmuxSession(tmux_session_name, window_name=win_label or window_name)
         if await orphan_tmux.is_alive():
             log.info(f"[{session_key}] Adopting orphaned tmux window '{orphan_tmux.window_name}' in '{tmux_session_name}'")
+            await orphan_tmux._exec(f"tmux set-option -t {shlex.quote(tmux_session_name)} history-limit 50000")
+            # Evict any discovered session using the bare tmux name — startup
+            # discovery registers under `name` but the heartbeat creates under
+            # `name:channel_id`.  Without this, two observe loops watch the
+            # same pane and the organic relay fires duplicates.
+            if name in self.sessions and name != session_key:
+                old = self.sessions.pop(name)
+                if old._observe_task:
+                    old._observe_task.cancel()
+                log.info(f"[{session_key}] Evicted discovered session '{name}' (superseded)")
             ms = ManagedSession(session_key, orphan_tmux, parser, working_dir=working_dir,
                                 channel_id=channel_id, team=team)
             self.sessions[session_key] = ms
@@ -1148,14 +1159,15 @@ class Monitor:
                 else:
                     channel_id = win_name
             working_dir = await tmux.get_pane_cwd() or None
-            ms = ManagedSession(session_name, tmux, parser,
+            key = self._session_key(session_name, channel_id)
+            ms = ManagedSession(key, tmux, parser,
                                 working_dir=working_dir,
                                 channel_id=channel_id, team=team)
             ms.state = parser.detect_state(visible)
             ms._observe_task = asyncio.create_task(self._observe_loop(ms))
-            self.sessions[session_name] = ms
+            self.sessions[key] = ms
 
-            log.info(f"Discovered existing session: {session_name} "
+            log.info(f"Discovered existing session: {key} "
                      f"(state={ms.state.value} channel={channel_id} team={team} "
                      f"working_dir={working_dir})")
 

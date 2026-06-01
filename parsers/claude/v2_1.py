@@ -20,17 +20,17 @@ class ClaudeV21Parser(TUIParser):
     RE_USER = re.compile(r'^\s*❯\s')
     RE_RESPONSE = re.compile(r'^\s*●\s')
     RE_COMPLETION = re.compile(r'^\s*✻\s+(?!.*…)(.+)')
-    RE_SPINNER_ACTIVE = re.compile(r'^\s*✻\s+.*…')
-    RE_THINKING_SPINNER = re.compile(r'^\s*✽\s')
+    RE_SPINNER_ACTIVE = re.compile(r'^\s*[·✢-✿]\s+.*…')
+    RE_THINKING_SPINNER = re.compile(r'^\s*[·✢-✿]\s')
     RE_SEPARATOR = re.compile(r'^─{10,}$')
-    RE_STATUS = re.compile(r'^\s*⏵')
+    RE_STATUS = re.compile(r'^\s*[⏵▸]')
     RE_VERSION = re.compile(r'Claude Code (v[\d.]+)')
     RE_DIALOG_SELECTION = re.compile(r'❯\s+\d+\.\s')
-    RE_SPINNER_LINE = re.compile(r'^\s*[✽✢]\s')
+    RE_SPINNER_LINE = re.compile(r'^\s*[·✢-✿]\s')
     RE_TOOL_INDICATOR = re.compile(r'^\s*⎿\s')
     RE_TOOL_HEADER = re.compile(r'^\s*●\s+(Reading|Writing|Editing|Running|Searching|Listing)\s')
     RE_TOOL_CALL_START = re.compile(r'^([A-Z]\w*)\(')
-    RE_TOKEN_STATS = re.compile(r'\(.*?[↓↑]\s*\d+\s*tokens?.*?\)')
+    RE_TOKEN_STATS = re.compile(r'\(.*?[↓↑]\s*[\d.]+k?\s*tokens?.*?\)')
     RE_CONVERSATION_PICKER = re.compile(r'^\s*[●○]\s+\S.*(?:↑/↓|to select|Enter to view|\d+[ms]\d*s?)\s*$')
 
     DIALOG_STRINGS = [
@@ -320,10 +320,14 @@ class ClaudeV21Parser(TUIParser):
                     self.RE_SEPARATOR.match(s) or
                     s.startswith('❯') or
                     self.RE_SPINNER_ACTIVE.match(s) or
+                    self.RE_SPINNER_LINE.match(s) or
                     self.RE_STATUS.match(s) or
                     self.RE_TOKEN_STATS.search(s) or
                     self.RE_CONVERSATION_PICKER.match(s) or
-                    'Claude Code' in s):
+                    'Claude Code' in s or
+                    'auto-compact' in s or
+                    'bypass permissions' in s or
+                    'esc to interrupt' in s):
                 content_end -= 1
             else:
                 break
