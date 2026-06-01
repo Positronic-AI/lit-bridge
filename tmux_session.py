@@ -174,9 +174,14 @@ class TmuxSession:
 
     async def kill(self):
         try:
-            await self._exec(
-                f"tmux kill-session -t {shlex.quote(self.session_name)}"
-            )
+            if self.window_name:
+                await self._exec(
+                    f"tmux kill-window -t {shlex.quote(self._target)}"
+                )
+            else:
+                await self._exec(
+                    f"tmux kill-session -t {shlex.quote(self.session_name)}"
+                )
         except Exception:
             pass
         self._alive = False
