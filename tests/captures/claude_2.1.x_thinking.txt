@@ -1,0 +1,19 @@
+╭────────────────────────────────────────────────────╮
+│ ✻ Claude Code v2.1.152                              │
+│                                                    │
+│   /opt/lit-platform                                │
+╰────────────────────────────────────────────────────╯
+
+❯ What is this project?
+
+● This is the LIT Platform, a workspace for AI-powered development.
+
+✻ 3.2s (12.3k↓ tokens, 847↑ tokens)
+
+─────────────────────────────────────────────────────
+
+❯ Refactor the parser into versioned modules
+
+✽ Thinking…
+
+⏵ esc to interrupt

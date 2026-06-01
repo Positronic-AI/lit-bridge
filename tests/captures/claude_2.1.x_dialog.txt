@@ -1,0 +1,11 @@
+╭──────────────────────────────────────────────────────────────╮
+│ ✻ Claude Code v2.1.152                                       │
+│                                                              │
+│   Do you trust the files in /opt/lit-platform?               │
+│   This folder has a CLAUDE.md with project instructions.     │
+│                                                              │
+│   ❯ 1. I trust this folder and its CLAUDE.md                 │
+│     2. I don't trust this folder                             │
+│                                                              │
+│   Enter to confirm · Esc to cancel                           │
+╰──────────────────────────────────────────────────────────────╯

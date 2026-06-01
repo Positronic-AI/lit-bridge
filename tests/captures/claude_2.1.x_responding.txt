@@ -1,0 +1,25 @@
+╭────────────────────────────────────────────────────╮
+│ ✻ Claude Code v2.1.152                              │
+│                                                    │
+│   /opt/lit-platform                                │
+╰────────────────────────────────────────────────────╯
+
+❯ What is this project?
+
+● This is the LIT Platform, a workspace for AI-powered development.
+
+✻ 3.2s (12.3k↓ tokens, 847↑ tokens)
+
+─────────────────────────────────────────────────────
+
+❯ Refactor the parser into versioned modules
+
+● I'll refactor the parser into versioned modules. Let me start by reading the
+  current structure.
+
+● Reading parsers/claude.py
+
+  ⎿ 202 lines
+
+● I'll create the new directory structure with version-specific parsers and a
+  registry for version matching.

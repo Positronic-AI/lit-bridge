@@ -32,6 +32,7 @@ class ClaudeV21Parser(TUIParser):
     RE_TOOL_CALL_START = re.compile(r'^([A-Z]\w*)\(')
     RE_TOKEN_STATS = re.compile(r'\(.*?[↓↑]\s*[\d.]+k?\s*tokens?.*?\)')
     RE_CONVERSATION_PICKER = re.compile(r'^\s*[●○]\s+\S.*(?:↑/↓|to select|Enter to view|\d+[ms]\d*s?)\s*$')
+    RE_COMPACT_PROGRESS = re.compile(r'^\d+%\s+until\s+auto-compact')
 
     DIALOG_STRINGS = [
         "Enter to confirm",
@@ -91,6 +92,8 @@ class ClaudeV21Parser(TUIParser):
                 break
             if self.RE_SEPARATOR.match(line):
                 continue
+            if self.RE_COMPACT_PROGRESS.match(line):
+                continue
             if line.startswith('❯'):
                 has_prompt = True
                 continue
@@ -109,6 +112,8 @@ class ClaudeV21Parser(TUIParser):
                 continue
             if self.RE_SEPARATOR.match(line):
                 continue
+            if self.RE_COMPACT_PROGRESS.match(line):
+                continue
             if line.startswith('❯'):
                 continue
             if self.RE_COMPLETION.match(line):
@@ -125,7 +130,8 @@ class ClaudeV21Parser(TUIParser):
             s = content_lines[-1].strip()
             if (not s or self.RE_CONVERSATION_PICKER.match(s) or
                     self.RE_SEPARATOR.match(s) or s.startswith('❯') or
-                    self.RE_STATUS.match(s)):
+                    self.RE_STATUS.match(s) or
+                    self.RE_COMPACT_PROGRESS.match(s)):
                 content_lines.pop()
             else:
                 break
@@ -319,10 +325,7 @@ class ClaudeV21Parser(TUIParser):
             if (not s or
                     self.RE_SEPARATOR.match(s) or
                     s.startswith('❯') or
-                    self.RE_SPINNER_ACTIVE.match(s) or
-                    self.RE_SPINNER_LINE.match(s) or
                     self.RE_STATUS.match(s) or
-                    self.RE_TOKEN_STATS.search(s) or
                     self.RE_CONVERSATION_PICKER.match(s) or
                     'Claude Code' in s or
                     'auto-compact' in s or
@@ -366,6 +369,23 @@ class ClaudeV21Parser(TUIParser):
                         if self.RE_COMPLETION.match(lines[i].strip()):
                             end_idx = i + 1
                             break
+
+        # Pre-response thinking or compaction: no ● yet but a spinner
+        # is visible.  Scan a few lines — compaction puts a progress
+        # bar below the spinner line.
+        if start_idx is None:
+            scanned = 0
+            for i in range(content_end - 1, -1, -1):
+                s = lines[i].strip()
+                if not s:
+                    continue
+                if self.RE_SPINNER_ACTIVE.match(s) or self.RE_THINKING_SPINNER.match(s):
+                    start_idx = i
+                    end_idx = content_end
+                    break
+                scanned += 1
+                if scanned >= 3:
+                    break
 
         if start_idx is None:
             return ""

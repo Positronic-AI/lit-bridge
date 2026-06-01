@@ -889,11 +889,15 @@ class Monitor:
                             self._emit(tool_evt)
                             last_response_change = now
 
-                    # Completion: idle + ✻ marker confirmed + debounce.
-                    # The CLI flickers between IDLE and RESPONDING during
-                    # tool calls — a single IDLE+confirmed snapshot is not
-                    # reliable.  Require the condition to hold for 2s.
-                    if new_state == SessionState.IDLE and turn_confirmed:
+                    # Completion: idle + ✻ marker confirmed + prompt
+                    # visible + debounce.  The ❯ prompt is the definitive
+                    # "CLI is waiting for input" signal.  Without it, ✻ may
+                    # be a per-tool-call marker mid-turn.
+                    prompt_visible = any(
+                        ln.strip().startswith('❯')
+                        for ln in visible.split('\n')[-8:])
+                    if (new_state == SessionState.IDLE and turn_confirmed
+                            and prompt_visible):
                         if idle_confirmed_since == 0.0:
                             idle_confirmed_since = now
                         if (now - idle_confirmed_since) >= COMPLETION_DEBOUNCE:
@@ -932,11 +936,12 @@ class Monitor:
                         idle_confirmed_since = 0.0
 
                     # Quiescence fallback: response stopped growing.
-                    # Use short timeout if ✻ confirmed (normal completion
-                    # the IDLE check somehow missed), long timeout otherwise
-                    # (tool calls can stall response text for 10-20s).
+                    # Use short timeout if truly complete (prompt visible),
+                    # long timeout otherwise (tool calls can stall response
+                    # text for 10-20s while the CLI thinks).
                     if ms._yielded and ms.observing:
-                        q_timeout = (QUIESCENCE_TIMEOUT if turn_confirmed
+                        truly_confirmed = turn_confirmed and prompt_visible
+                        q_timeout = (QUIESCENCE_TIMEOUT if truly_confirmed
                                      else QUIESCENCE_UNCONFIRMED_TIMEOUT)
                         if ((now - last_response_change) > q_timeout and
                                 new_state in (SessionState.IDLE,

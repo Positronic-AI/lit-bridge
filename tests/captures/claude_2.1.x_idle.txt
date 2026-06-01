@@ -1,0 +1,29 @@
+╭────────────────────────────────────────────────────╮
+│ ✻ Claude Code v2.1.152                              │
+│                                                    │
+│   /opt/lit-platform                                │
+╰────────────────────────────────────────────────────╯
+
+ Tips for getting started:
+  • Ask questions about your codebase
+  • Make changes to files
+  • Run terminal commands
+
+❯ What is this project?
+
+● This is the LIT Platform, a workspace for AI-powered development. The project
+  includes several components:
+
+  - **lit-lib** — Python package with ML engine and agentic layer
+  - **lit-server** — Angular frontend
+  - **lit-monitor** — Terminal session management daemon
+  - **scripts/** — Deployment and utility scripts
+
+  The platform connects AI CLI tools (like Claude Code) to a web-based workspace
+  with channels, persistence, and collaboration features.
+
+✻ 3.2s (12.3k↓ tokens, 847↑ tokens)
+
+─────────────────────────────────────────────────────
+
+❯

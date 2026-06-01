@@ -1,0 +1,27 @@
+╭────────────────────────────────────────────────────╮
+│ ✻ Claude Code v2.1.152                              │
+│                                                    │
+│   /opt/lit-platform                                │
+╰────────────────────────────────────────────────────╯
+
+❯ Read the monitor.py file
+
+● Reading lit-monitor/monitor.py
+
+  ⎿ 980 lines (ctrl+e to expand)
+
+● The monitor.py file is the core daemon for lit-monitor. Here are the key
+  components:
+
+  1. **Session management** — `ManagedSession` wraps a tmux session with its
+     parser and observation state
+  2. **Event loop** — polls tmux capture-pane at 300ms intervals
+  3. **State machine** — detects IDLE/THINKING/RESPONDING/DIALOG transitions
+  4. **Message extraction** — parses user/assistant messages from TUI output
+  5. **Idle reaping** — kills sessions idle >10min, stores for `--resume`
+
+✻ 5.1s (24.7k↓ tokens, 1.2k↑ tokens)
+
+─────────────────────────────────────────────────────
+
+❯
