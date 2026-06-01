@@ -50,19 +50,6 @@ class ClaudeV21Parser(TUIParser):
     ]
 
     def _is_tui_chrome(self, line: str) -> bool:
-        s = line.strip()
-        if not s:
-            return False
-        if self.RE_SPINNER_LINE.match(s):
-            return True
-        if self.RE_TOOL_INDICATOR.match(s):
-            return True
-        if self.RE_TOOL_HEADER.match(s):
-            return True
-        if self.RE_TOKEN_STATS.search(s):
-            return True
-        if 'ctrl+o to expand' in s or 'ctrl+e to expand' in s:
-            return True
         return False
 
     def detect_state(self, capture: str) -> SessionState:
@@ -214,9 +201,7 @@ class ClaudeV21Parser(TUIParser):
                     self.RE_USER.match(stripped) or
                     self.RE_SEPARATOR.match(stripped) or
                     self.RE_STATUS.match(stripped) or
-                    self.RE_COMPLETION.match(stripped) or
-                    self.RE_SPINNER_LINE.match(stripped) or
-                    self.RE_TOKEN_STATS.search(stripped)):
+                    self.RE_COMPLETION.match(stripped)):
                 i += 1
                 continue
 
@@ -248,12 +233,6 @@ class ClaudeV21Parser(TUIParser):
                                 self.RE_STATUS.match(s) or
                                 self.RE_COMPLETION.match(s)):
                             break
-                        if self.RE_TOKEN_STATS.search(s):
-                            i += 1
-                            continue
-                        if self.RE_SPINNER_LINE.match(s):
-                            i += 1
-                            continue
                         output_lines.append(lines[i].rstrip())
                         i += 1
                     if output_lines:
