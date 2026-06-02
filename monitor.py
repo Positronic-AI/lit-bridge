@@ -74,6 +74,15 @@ CLI_DEFAULTS = {
 }
 
 
+def _parse_compact_pct(capture: str) -> Optional[int]:
+    """Extract the auto-compact percentage from visible capture."""
+    for line in capture.split('\n'):
+        m = re.match(r'^\s*(\d+)%\s+until\s+auto-compact', line.strip())
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def find_cli(name: str) -> str:
     path = shutil.which(name)
     if not path:
@@ -618,6 +627,7 @@ class Monitor:
         ms._streaming_tool_output = False
         ms._last_tool_output_content = ""
         ms._is_organic = False
+        ms._compact_pct_start = _parse_compact_pct(visible)
         ms.observing = True
 
         try:
@@ -913,11 +923,14 @@ class Monitor:
                                                  "text": response})
                                     ms._yielded = response
                             if ms._yielded:
+                                compact_pct_now = _parse_compact_pct(visible)
                                 evt = {"session": ms.name,
                                        "event": "complete",
                                        "total_length": len(ms._yielded),
                                        "content": ms._yielded,
-                                       "organic": ms._is_organic}
+                                       "organic": ms._is_organic,
+                                       "compact_pct_start": getattr(ms, '_compact_pct_start', None),
+                                       "compact_pct_end": compact_pct_now}
                                 if ms.channel_id:
                                     evt["channel_id"] = ms.channel_id
                                 if ms.team:
@@ -926,7 +939,8 @@ class Monitor:
                                 ms.observing = False
                                 idle_confirmed_since = 0.0
                                 last_observe_complete = now
-                                log.info(f"[{ms.name}] Response complete ({len(ms._yielded)} chars)")
+                                log.info(f"[{ms.name}] Response complete ({len(ms._yielded)} chars, "
+                                         f"compact {getattr(ms, '_compact_pct_start', '?')}%→{compact_pct_now}%)")
                                 if ms._jsonl_watcher:
                                     meta = ms._jsonl_watcher.get_turn_metadata()
                                     if meta:
@@ -950,11 +964,14 @@ class Monitor:
                                 self._emit({"session": ms.name,
                                              "event": "tool_result_done"})
                                 ms._streaming_tool_output = False
+                            compact_pct_now = _parse_compact_pct(visible)
                             q_evt = {"session": ms.name, "event": "complete",
                                     "total_length": len(ms._yielded),
                                     "content": ms._yielded,
                                     "reason": "quiescence",
-                                    "organic": ms._is_organic}
+                                    "organic": ms._is_organic,
+                                    "compact_pct_start": getattr(ms, '_compact_pct_start', None),
+                                    "compact_pct_end": compact_pct_now}
                             if ms.channel_id:
                                 q_evt["channel_id"] = ms.channel_id
                             if ms.team:
@@ -965,7 +982,8 @@ class Monitor:
                             # may still flicker, causing false re-triggers.
                             last_observe_complete = now + 15.0
                             log.info(f"[{ms.name}] Response complete "
-                                     f"(quiescence, confirmed={turn_confirmed})")
+                                     f"(quiescence, confirmed={turn_confirmed}, "
+                                     f"compact {getattr(ms, '_compact_pct_start', '?')}%→{compact_pct_now}%)")
                             if ms._jsonl_watcher:
                                 meta = ms._jsonl_watcher.get_turn_metadata()
                                 if meta:
