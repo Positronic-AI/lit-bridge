@@ -309,32 +309,61 @@ class ClaudeV21Parser(TUIParser):
                     'Claude Code' in s or
                     'auto-compact' in s or
                     'bypass permissions' in s or
-                    'esc to interrupt' in s):
+                    'esc to interrupt' in s or
+                    'paste again to expand' in s or
+                    'Run /doctor' in s or
+                    'Auto-update failed' in s):
                 content_end -= 1
             else:
                 break
 
-        bullet_count = 0
         start_idx = None
         end_idx = content_end
 
-        for i, line in enumerate(lines[:content_end]):
-            if self.RE_RESPONSE.match(line.strip()):
-                bullet_count += 1
-                if bullet_count == baseline_count + 1 and start_idx is None:
-                    start_idx = i
-
-            if start_idx is not None and self.RE_COMPLETION.match(line.strip()):
-                end_idx = i + 1  # include the ✻ line
+        # Strategy 1: Prompt landmark — find the last ❯ (user input)
+        # and extract from the first ● after it.  This is the most
+        # reliable strategy because it doesn't depend on absolute
+        # bullet counts, which drift when scrollback overflow removes
+        # old ● lines between the baseline capture and observation.
+        last_prompt_idx = None
+        for i in range(content_end - 1, -1, -1):
+            if self.RE_USER.match(lines[i]):
+                last_prompt_idx = i
                 break
+        if last_prompt_idx is not None:
+            for i in range(last_prompt_idx + 1, content_end):
+                if self.RE_RESPONSE.match(lines[i].strip()):
+                    start_idx = i
+                    break
+            if start_idx is not None:
+                for i in range(start_idx + 1, content_end):
+                    if self.RE_COMPLETION.match(lines[i].strip()):
+                        end_idx = i + 1
+                        break
 
-        # Scrollback truncation: old messages fell off the buffer.
-        # Find the sent message text as a landmark instead.
-        if start_idx is None and bullet_count < baseline_count and sent_content:
+        # Strategy 2: Bullet counting — works when no ❯ is visible
+        # (e.g., user input scrolled off in a very long response).
+        if start_idx is None:
+            bullet_count = 0
+            for i, line in enumerate(lines[:content_end]):
+                if self.RE_RESPONSE.match(line.strip()):
+                    bullet_count += 1
+                    if bullet_count == baseline_count + 1 and start_idx is None:
+                        start_idx = i
+
+                if start_idx is not None and self.RE_COMPLETION.match(line.strip()):
+                    end_idx = i + 1
+                    break
+
+        # Strategy 3: Needle search — find sent message text as landmark
+        # when scrollback truncated too many bullets.  Search from
+        # BOTTOM to find the most recent occurrence (channel prompts
+        # reuse similar text across turns).
+        if start_idx is None and sent_content:
             needle = sent_content.strip().split('\n')[0][:80]
             sent_line_idx = None
-            for i, line in enumerate(lines[:content_end]):
-                if needle and needle in line:
+            for i in range(content_end - 1, -1, -1):
+                if needle and needle in lines[i]:
                     sent_line_idx = i
                     break
             if sent_line_idx is not None:
