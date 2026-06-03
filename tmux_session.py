@@ -155,6 +155,12 @@ class TmuxSession:
             f"tmux display-message -t {target} -p '#W'")
         return stdout.strip() if rc == 0 else ""
 
+    async def get_pane_width(self) -> int:
+        target = shlex.quote(self._target)
+        rc, stdout, _ = await self._exec(
+            f"tmux display-message -t {target} -p '#{{pane_width}}'")
+        return int(stdout.strip()) if rc == 0 and stdout.strip().isdigit() else TMUX_WIDTH
+
     async def get_pane_cwd(self) -> str:
         target = shlex.quote(self._target)
         rc, stdout, _ = await self._exec(

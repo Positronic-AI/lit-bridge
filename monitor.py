@@ -83,6 +83,44 @@ def _parse_compact_pct(capture: str) -> Optional[int]:
     return None
 
 
+def _unwrap_tmux_lines(text: str, pane_width: int) -> str:
+    """Remove hard line breaks from tmux captures.
+
+    Two kinds of wrapping:
+    1. Tmux hard wrap — line is exactly pane_width chars.  Join directly.
+    2. TUI word wrap — the CLI word-wraps within its ●/continuation block.
+       The previous line is near-full (>= pane_width - 20) and the next
+       line starts with the 2-space continuation indent.  Join with space.
+    Structural continuations (list items, code fences, tool output) are
+    preserved.
+    """
+    if not text or pane_width <= 0:
+        return text
+    threshold = pane_width - 20
+    lines = text.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        while i + 1 < len(lines) and lines[i + 1]:
+            next_line = lines[i + 1]
+            if (len(lines[i]) >= threshold
+                    and next_line.startswith('  ')
+                    and len(next_line) > 2
+                    and next_line[2] not in '-*>⎿#`│┌└├'
+                    and not (next_line[2].isdigit() and '.' in next_line[2:5])):
+                i += 1
+                line = line.rstrip() + ' ' + lines[i].lstrip()
+            elif len(lines[i]) == pane_width:
+                i += 1
+                line += lines[i]
+            else:
+                break
+        result.append(line)
+        i += 1
+    return '\n'.join(result)
+
+
 def find_cli(name: str) -> str:
     path = shutil.which(name)
     if not path:
@@ -609,11 +647,12 @@ class Monitor:
 
         full_capture = await ms.tmux.capture_pane()
         baseline_count = ms.parser.count_assistant_messages(full_capture)
+        ms._pane_width = await ms.tmux.get_pane_width()
 
         if ms._jsonl_watcher:
             ms._jsonl_watcher.begin_turn()
 
-        log.info(f"[{sk}] Sending {len(content)} chars (baseline={baseline_count})")
+        log.info(f"[{sk}] Sending {len(content)} chars (baseline={baseline_count}, pane_width={ms._pane_width})")
 
         # Set observation state BEFORE sending to tmux to prevent the
         # observe loop from racing and marking this as organic
@@ -824,6 +863,7 @@ class Monitor:
                         (now - last_observe_complete) > AUTO_OBSERVE_COOLDOWN):
                     full_capture = await ms.tmux.capture_pane()
                     ms._baseline_count = ms.parser.count_assistant_messages(full_capture)
+                    ms._pane_width = await ms.tmux.get_pane_width()
                     ms._yielded = ""
                     blocks = ms.parser.extract_content_blocks(full_capture)
                     ms._baseline_tool_count = len(
@@ -859,6 +899,7 @@ class Monitor:
                     response = ms.parser.extract_raw_response(
                         ms._baseline_count, full_capture,
                         sent_content=getattr(ms, '_sent_content', None))
+                    response = _unwrap_tmux_lines(response, getattr(ms, '_pane_width', 0))
 
                     # Detect definitive turn completion: a line-start ✻
                     # marker (e.g. "✻ Brewed for 9s") after the last
@@ -917,6 +958,7 @@ class Monitor:
                                 response = ms.parser.extract_raw_response(
                                     ms._baseline_count, full_capture,
                                     sent_content=getattr(ms, '_sent_content', None))
+                                response = _unwrap_tmux_lines(response, getattr(ms, '_pane_width', 0))
                                 if response:
                                     self._emit({"session": ms.name,
                                                  "event": "replace",
