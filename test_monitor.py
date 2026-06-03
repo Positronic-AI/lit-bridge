@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration test for tether.
+"""Integration test for lit-bridge.
 
 Spawns monitor as a subprocess, sends commands via stdin,
 reads events from stdout. No LIT dependencies.
@@ -152,7 +152,7 @@ async def test_create_and_send():
 
 
 async def main():
-    print("=== tether integration tests ===\n")
+    print("=== lit-bridge integration tests ===\n")
 
     print("--- test_ping ---")
     await test_ping()

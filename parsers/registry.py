@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple, Type
 
 from .base import TUIParser
 
-log = logging.getLogger("tether")
+log = logging.getLogger("lit-bridge")
 
 VersionRange = Tuple[str, Optional[str]]  # (min_version, max_version_exclusive)
 

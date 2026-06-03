@@ -1,4 +1,4 @@
-# tether
+# lit-bridge
 
 A lightweight daemon that manages interactive AI CLI sessions in tmux and streams structured events to your application.
 
@@ -6,7 +6,7 @@ A lightweight daemon that manages interactive AI CLI sessions in tmux and stream
 
 ## What it does
 
-tether sits between your application and an AI CLI (like Claude Code). It:
+lit-bridge sits between your application and an AI CLI (like Claude Code). It:
 
 1. Spawns CLI sessions inside tmux panes
 2. Sends messages by typing into the terminal
@@ -14,30 +14,30 @@ tether sits between your application and an AI CLI (like Claude Code). It:
 4. Extracts response content from the terminal capture
 5. Streams structured JSON events back to your application
 
-Your application speaks a simple JSON-lines protocol over a Unix socket. It never touches tmux, never parses terminal output, never manages processes. tether handles all of that.
+Your application speaks a simple JSON-lines protocol over a Unix socket. It never touches tmux, never parses terminal output, never manages processes. lit-bridge handles all of that.
 
 ## Why
 
 AI CLIs are interactive tools designed for humans. They render rich TUIs with spinners, tool call animations, progress bars, and context management (compaction, resumption). Using `-p` pipe mode or `--output-format json` strips all of that away and reclassifies your usage as programmatic.
 
-tether preserves the interactive nature of the session. The CLI runs in a real terminal. It manages its own context window, its own tool permissions, its own MCP servers. Your application just sends messages and receives responses — through the front door, not a pipe.
+lit-bridge preserves the interactive nature of the session. The CLI runs in a real terminal. It manages its own context window, its own tool permissions, its own MCP servers. Your application just sends messages and receives responses — through the front door, not a pipe.
 
 ## Quick start
 
 ```bash
 # Start the daemon
-python3 monitor.py --socket /tmp/tether.sock
+python3 monitor.py --socket /tmp/lit-bridge.sock
 
 # In another terminal, connect and interact:
 # (using socat for demo — your app would use a proper socket client)
 
 # Create a session
 echo '{"cmd":"create","session":"demo","cli":"claude","parser":"claude-code","args":["--model","sonnet"]}' \
-  | socat - UNIX-CONNECT:/tmp/tether.sock
+  | socat - UNIX-CONNECT:/tmp/lit-bridge.sock
 
 # Send a message
 echo '{"cmd":"send","session":"demo","content":"What is the capital of France?"}' \
-  | socat - UNIX-CONNECT:/tmp/tether.sock
+  | socat - UNIX-CONNECT:/tmp/lit-bridge.sock
 
 # Events stream back as JSON lines:
 # {"session":"demo","event":"state","from":"idle","to":"thinking"}
@@ -47,9 +47,9 @@ echo '{"cmd":"send","session":"demo","content":"What is the capital of France?"}
 
 ## Protocol
 
-tether speaks JSON-lines. One JSON object per line, newline-delimited, over a Unix domain socket.
+lit-bridge speaks JSON-lines. One JSON object per line, newline-delimited, over a Unix domain socket.
 
-### Commands (client → tether)
+### Commands (client → lit-bridge)
 
 #### `create` — Start a new CLI session
 
@@ -140,7 +140,7 @@ Response:
 
 Response: `{"event": "pong"}`
 
-### Events (tether → client)
+### Events (lit-bridge → client)
 
 #### `state` — CLI state changed
 
@@ -195,26 +195,26 @@ The `compact_pct_start`/`compact_pct_end` fields track context compaction. If co
 
 ```
 ┌─────────────┐     JSON-lines      ┌─────────────┐     tmux      ┌───────────┐
-│  Your App   │◄────────────────────►│   tether    │◄────────────►│ Claude CLI│
+│  Your App   │◄────────────────────►│   lit-bridge    │◄────────────►│ Claude CLI│
 │             │   Unix socket        │   daemon     │   capture +  │  (in tmux)│
 └─────────────┘                      └─────────────┘   send-keys   └───────────┘
 ```
 
 - **Your application** connects to the Unix socket and sends commands / receives events.
-- **tether** manages tmux sessions, polls the terminal capture, detects state transitions, extracts response text, and emits structured events.
+- **lit-bridge** manages tmux sessions, polls the terminal capture, detects state transitions, extracts response text, and emits structured events.
 - **The CLI** runs in a real tmux pane with a real terminal. It doesn't know it's being monitored.
 
 ### Multi-session support
 
-One tether daemon manages multiple sessions. Each session is a separate tmux window. Sessions can be grouped by `channel_id` — multiple channels share a tmux session (separate windows) but have independent state tracking and event routing.
+One lit-bridge daemon manages multiple sessions. Each session is a separate tmux window. Sessions can be grouped by `channel_id` — multiple channels share a tmux session (separate windows) but have independent state tracking and event routing.
 
 ### Session lifecycle
 
-Sessions survive tether restarts. When the daemon starts, it discovers existing tmux sessions and adopts them. Idle sessions are reaped after 1 hour and can be resumed on the next `create` (the CLI's `--resume` flag restores the conversation).
+Sessions survive lit-bridge restarts. When the daemon starts, it discovers existing tmux sessions and adopts them. Idle sessions are reaped after 1 hour and can be resumed on the next `create` (the CLI's `--resume` flag restores the conversation).
 
 ### Parsers
 
-tether is CLI-agnostic. All TUI-specific logic lives in parser plugins:
+lit-bridge is CLI-agnostic. All TUI-specific logic lives in parser plugins:
 
 ```
 parsers/
@@ -242,10 +242,10 @@ Register it in `parsers/registry.py` and pass the parser name in the `create` co
 
 ## Modes
 
-**Socket mode** (recommended): tether listens on a Unix domain socket and runs as a daemon. Survives client disconnects and reconnects. Buffers events while no client is connected.
+**Socket mode** (recommended): lit-bridge listens on a Unix domain socket and runs as a daemon. Survives client disconnects and reconnects. Buffers events while no client is connected.
 
 ```bash
-python3 monitor.py --socket /tmp/tether.sock
+python3 monitor.py --socket /tmp/lit-bridge.sock
 ```
 
 **Stdio mode**: Reads commands from stdin, writes events to stdout. Dies when the parent process exits. Useful for testing.

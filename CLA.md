@@ -1,6 +1,6 @@
 # Contributor License Agreement
 
-Thank you for your interest in contributing to tether, owned by
+Thank you for your interest in contributing to lit-bridge, owned by
 Positronic AI, Inc. ("Positronic"). To clarify the intellectual property
 rights in the project, we require contributors to sign this Contributor
 License Agreement ("CLA").
