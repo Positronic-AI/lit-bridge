@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""lit-monitor: AI CLI session multiplexer.
+"""tether: AI CLI session multiplexer.
 
 A lightweight daemon that manages interactive AI CLI sessions in tmux.
 Speaks JSON-lines protocol. Knows nothing about LIT.
@@ -10,7 +10,7 @@ Modes:
 
 Usage:
   python3 monitor.py                          # stdio mode
-  python3 monitor.py --socket /tmp/lit-monitor-ben.sock   # socket mode
+  python3 monitor.py --socket /tmp/tether-ben.sock   # socket mode
 
 Protocol (same in both modes):
   → {"cmd": "create", "session": "name", "cli": "claude", "parser": "claude-code",
@@ -56,7 +56,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     stream=sys.stderr,
 )
-log = logging.getLogger("lit-monitor")
+log = logging.getLogger("tether")
 
 POLL_INTERVAL = 0.3
 STARTUP_WAIT = 3.0
@@ -1053,7 +1053,7 @@ class Monitor:
     # ── Main loop ───────────────────────────────────────────
 
     async def run(self):
-        log.info(f"lit-monitor starting (mode={'socket' if self._socket_path else 'stdio'})")
+        log.info(f"tether starting (mode={'socket' if self._socket_path else 'stdio'})")
 
         await self._discover_existing()
 
@@ -1262,7 +1262,7 @@ def _run_test_parser():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="lit-monitor: AI CLI session multiplexer")
+    parser = argparse.ArgumentParser(description="tether: AI CLI session multiplexer")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("test-parser", help="Run snapshot-based parser validation tests")
 
