@@ -911,7 +911,7 @@ class Monitor:
                     turn_confirmed = False
                     last_bullet_line = -1
                     for li, ln in enumerate(full_capture.split('\n')):
-                        if re.match(r'^\s*●\s', ln):
+                        if re.match(r'^\s*●\s', ln) and not ms.parser.RE_CONVERSATION_PICKER.match(ln.strip()):
                             last_bullet_line = li
                     if last_bullet_line >= 0:
                         after_lines = full_capture.split('\n')[last_bullet_line:]

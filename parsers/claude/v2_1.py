@@ -31,7 +31,7 @@ class ClaudeV21Parser(TUIParser):
     RE_TOOL_HEADER = re.compile(r'^\s*●\s+(Reading|Writing|Editing|Running|Searching|Listing)\s')
     RE_TOOL_CALL_START = re.compile(r'^([A-Z]\w*)\(')
     RE_TOKEN_STATS = re.compile(r'\(.*?[↓↑]\s*[\d.]+k?\s*tokens?.*?\)')
-    RE_CONVERSATION_PICKER = re.compile(r'^\s*[●○]\s+\S.*(?:↑/↓|to select|Enter to view|\d+[ms]\d*s?)\s*$')
+    RE_CONVERSATION_PICKER = re.compile(r'^\s*[●○◯]\s+\S.*(?:↑/↓|to select|Enter to view|\d+[ms]\d*s?)')
     RE_COMPACT_PROGRESS = re.compile(r'^\d+%\s+until\s+auto-compact')
 
     DIALOG_STRINGS = [
