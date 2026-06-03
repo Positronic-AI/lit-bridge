@@ -875,14 +875,16 @@ class Monitor:
                     if ms._jsonl_watcher:
                         user_msg = ms._jsonl_watcher.get_last_user_message()
                         log.info(f"[{ms.name}] Organic user_input lookup: {user_msg!r}")
-                        if user_msg:
-                            evt = {"session": ms.name, "event": "user_input",
-                                   "text": user_msg, "organic": True}
-                            if ms.channel_id:
-                                evt["channel_id"] = ms.channel_id
-                            if ms.team:
-                                evt["team"] = ms.team
-                            self._emit(evt)
+                        if not user_msg:
+                            log.info(f"[{ms.name}] Skipping auto-observe — no user message in JSONL")
+                            continue
+                        evt = {"session": ms.name, "event": "user_input",
+                               "text": user_msg, "organic": True}
+                        if ms.channel_id:
+                            evt["channel_id"] = ms.channel_id
+                        if ms.team:
+                            evt["team"] = ms.team
+                        self._emit(evt)
                         ms._jsonl_watcher.begin_turn()
                     else:
                         log.info(f"[{ms.name}] No JSONL watcher for organic input")
