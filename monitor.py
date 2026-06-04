@@ -338,6 +338,11 @@ class JsonlWatcher:
             return None
         return f.stem  # filename without .jsonl extension
 
+    _CLI_EXIT_NOISE = re.compile(
+        r'^<local-command-stdout>\s*Bye!?\s*</local-command-stdout>$')
+    _CLI_COMMAND_TAG = re.compile(
+        r'<command-name>\s*/\w+')
+
     def get_last_user_message(self) -> Optional[str]:
         """Read the JSONL backwards to find the most recent user text message."""
         f = self._file or self._find_active_jsonl()
@@ -362,13 +367,17 @@ class JsonlWatcher:
             msg = entry.get('message', {})
             content = msg.get('content', '')
             if isinstance(content, str) and content.strip():
-                log.info(f"get_last_user_message: found at user#{user_count}: {content.strip()[:80]!r}")
-                return content.strip()
+                stripped = content.strip()
+                if self._CLI_EXIT_NOISE.match(stripped) or self._CLI_COMMAND_TAG.search(stripped):
+                    log.info(f"get_last_user_message: skipping CLI noise at user#{user_count}")
+                    continue
+                log.info(f"get_last_user_message: found at user#{user_count}: {stripped[:80]!r}")
+                return stripped
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get('type') == 'text':
                         text = block.get('text', '').strip()
-                        if text:
+                        if text and not self._CLI_EXIT_NOISE.match(text) and not self._CLI_COMMAND_TAG.search(text):
                             log.info(f"get_last_user_message: found block at user#{user_count}: {text[:80]!r}")
                             return text
             if user_count >= 3:
@@ -921,6 +930,7 @@ class Monitor:
                                 break
 
                     if response != ms._yielded:
+                        has_bullet = bool(re.match(r'^\s*●\s', response))
                         evt = {"session": ms.name, "event": "replace",
                                "text": response,
                                "organic": ms._is_organic}
@@ -929,7 +939,11 @@ class Monitor:
                         if ms.team:
                             evt["team"] = ms.team
                         self._emit(evt)
-                        ms._yielded = response
+                        # Only persist content with a response bullet as
+                        # the authoritative response — spinner/thinking
+                        # chrome streams for UX but must not be saved.
+                        if has_bullet:
+                            ms._yielded = response
                         last_response_change = now
 
                     # JSONL watcher: drain events, keep metadata
@@ -961,7 +975,10 @@ class Monitor:
                                     ms._baseline_count, full_capture,
                                     sent_content=getattr(ms, '_sent_content', None))
                                 response = _unwrap_tmux_lines(response, getattr(ms, '_pane_width', 0))
-                                if response:
+                                # Only save as final content if it has a real
+                                # response bullet — spinner/thinking chrome
+                                # should not become the saved message.
+                                if response and re.match(r'^\s*●\s', response):
                                     self._emit({"session": ms.name,
                                                  "event": "replace",
                                                  "text": response})
@@ -1190,7 +1207,7 @@ class Monitor:
             log.info(f"Client disconnected (buffering events)")
 
     async def _discover_existing(self):
-        """Find running lit-* tmux sessions on startup."""
+        """Find running lit-* tmux sessions and all their windows on startup."""
         try:
             proc = await asyncio.create_subprocess_shell(
                 "tmux ls 2>/dev/null || true",
@@ -1209,34 +1226,53 @@ class Monitor:
             if not session_name.startswith('lit-'):
                 continue
 
-            tmux = TmuxSession(session_name)
-            tmux._alive = True
-            parser = select_parser("claude-code")
+            # List all windows in this session
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    f"tmux list-windows -t {shlex.quote(session_name)}"
+                    f" -F '#{{window_name}}'",
+                    stdout=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                window_names = [
+                    w.strip() for w in
+                    stdout.decode('utf-8', errors='replace').strip().split('\n')
+                    if w.strip()
+                ]
+            except Exception:
+                window_names = []
 
-            visible = await tmux.capture_pane(visible_only=True)
-            if not visible.strip():
+            if not window_names:
                 continue
 
-            win_name = await tmux.get_window_name()
-            channel_id = None
-            team = None
-            if win_name and win_name not in CLI_DEFAULTS:
-                if ':' in win_name:
-                    team, channel_id = win_name.split(':', 1)
-                else:
-                    channel_id = win_name
-            working_dir = await tmux.get_pane_cwd() or None
-            key = self._session_key(session_name, channel_id)
-            ms = ManagedSession(key, tmux, parser,
-                                working_dir=working_dir,
-                                channel_id=channel_id, team=team)
-            ms.state = parser.detect_state(visible)
-            ms._observe_task = asyncio.create_task(self._observe_loop(ms))
-            self.sessions[key] = ms
+            for win_name in window_names:
+                tmux = TmuxSession(session_name, window_name=win_name)
+                tmux._alive = True
+                parser = select_parser("claude-code")
 
-            log.info(f"Discovered existing session: {key} "
-                     f"(state={ms.state.value} channel={channel_id} team={team} "
-                     f"working_dir={working_dir})")
+                visible = await tmux.capture_pane(visible_only=True)
+                if not visible.strip():
+                    continue
+
+                channel_id = None
+                team = None
+                if win_name not in CLI_DEFAULTS:
+                    if ':' in win_name:
+                        team, channel_id = win_name.split(':', 1)
+                    else:
+                        channel_id = win_name
+                working_dir = await tmux.get_pane_cwd() or None
+                key = self._session_key(session_name, channel_id)
+                ms = ManagedSession(key, tmux, parser,
+                                    working_dir=working_dir,
+                                    channel_id=channel_id, team=team)
+                ms.state = parser.detect_state(visible)
+                ms._observe_task = asyncio.create_task(self._observe_loop(ms))
+                self.sessions[key] = ms
+
+                log.info(f"Discovered existing session: {key} "
+                         f"(state={ms.state.value} channel={channel_id} team={team} "
+                         f"window={win_name} working_dir={working_dir})")
 
     async def _shutdown(self):
         log.info(f"Shutting down ({len(self.sessions)} sessions still running)")
