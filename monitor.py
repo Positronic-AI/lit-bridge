@@ -785,6 +785,7 @@ class Monitor:
         last_capture_change = time.monotonic()
         last_observe_complete = time.monotonic()
         idle_confirmed_since = 0.0  # when IDLE+confirmed was first seen
+        idle_confirmed_content = ""  # _yielded snapshot when debounce started
         prev_capture = ""
         poll_count = 0
 
@@ -967,6 +968,11 @@ class Monitor:
                             and prompt_visible):
                         if idle_confirmed_since == 0.0:
                             idle_confirmed_since = now
+                            idle_confirmed_content = ms._yielded
+                        elif ms._yielded != idle_confirmed_content:
+                            # Response grew during debounce — restart
+                            idle_confirmed_since = now
+                            idle_confirmed_content = ms._yielded
                         if (now - idle_confirmed_since) >= COMPLETION_DEBOUNCE:
                             if not ms._yielded:
                                 await asyncio.sleep(0.5)
@@ -999,6 +1005,7 @@ class Monitor:
                                 self._emit(evt)
                                 ms.observing = False
                                 idle_confirmed_since = 0.0
+                                idle_confirmed_content = ""
                                 last_observe_complete = now
                                 log.info(f"[{ms.name}] Response complete ({len(ms._yielded)} chars, "
                                          f"compact {getattr(ms, '_compact_pct_start', '?')}%→{compact_pct_now}%)")
@@ -1009,6 +1016,7 @@ class Monitor:
                                                      "event": "metadata", **meta})
                     else:
                         idle_confirmed_since = 0.0
+                        idle_confirmed_content = ""
 
                     # Quiescence fallback: response stopped growing.
                     # Use short timeout if truly complete (prompt visible),
