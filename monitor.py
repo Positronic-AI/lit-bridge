@@ -982,8 +982,14 @@ class Monitor:
                     prompt_visible = any(
                         ln.strip().startswith('❯')
                         for ln in visible.split('\n')[-8:])
+                    # Active spinner in the response means the CLI is
+                    # still processing (e.g. retrying a tool call).
+                    has_active_spinner = any(
+                        ms.parser.RE_SPINNER_ACTIVE.match(ln)
+                        for ln in (ms._yielded or '').split('\n'))
                     if (new_state == SessionState.IDLE and turn_confirmed
-                            and prompt_visible):
+                            and prompt_visible
+                            and not has_active_spinner):
                         if idle_confirmed_since == 0.0:
                             idle_confirmed_since = now
                             idle_confirmed_content = ms._yielded
