@@ -338,10 +338,8 @@ class JsonlWatcher:
             return None
         return f.stem  # filename without .jsonl extension
 
-    _CLI_EXIT_NOISE = re.compile(
-        r'^<local-command-stdout>\s*Bye!?\s*</local-command-stdout>$')
-    _CLI_COMMAND_TAG = re.compile(
-        r'<command-name>\s*/\w+')
+    _CLI_INTERNAL_MSG = re.compile(
+        r'<(local-command-\w+|command-name)\b')
 
     def get_last_user_message(self) -> Optional[str]:
         """Read the JSONL backwards to find the most recent user text message."""
@@ -368,8 +366,8 @@ class JsonlWatcher:
             content = msg.get('content', '')
             if isinstance(content, str) and content.strip():
                 stripped = content.strip()
-                if self._CLI_EXIT_NOISE.match(stripped) or self._CLI_COMMAND_TAG.search(stripped):
-                    log.info(f"get_last_user_message: skipping CLI noise at user#{user_count}")
+                if self._CLI_INTERNAL_MSG.search(stripped):
+                    log.info(f"get_last_user_message: skipping CLI internal msg at user#{user_count}")
                     continue
                 log.info(f"get_last_user_message: found at user#{user_count}: {stripped[:80]!r}")
                 return stripped
@@ -377,7 +375,7 @@ class JsonlWatcher:
                 for block in content:
                     if isinstance(block, dict) and block.get('type') == 'text':
                         text = block.get('text', '').strip()
-                        if text and not self._CLI_EXIT_NOISE.match(text) and not self._CLI_COMMAND_TAG.search(text):
+                        if text and not self._CLI_INTERNAL_MSG.search(text):
                             log.info(f"get_last_user_message: found block at user#{user_count}: {text[:80]!r}")
                             return text
             if user_count >= 3:
