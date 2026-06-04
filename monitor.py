@@ -140,8 +140,14 @@ class JsonlWatcher:
     def __init__(self, project_dir: Path):
         self._project_dir = project_dir
         self._file: Optional[Path] = None
-        self._pos: int = 0
         self._emitted_tool_ids: set = set()
+        # Start at end-of-file so we only see NEW entries
+        f = self._find_active_jsonl()
+        if f and f.exists():
+            self._file = f
+            self._pos = f.stat().st_size
+        else:
+            self._pos = 0
 
     def _find_active_jsonl(self) -> Optional[Path]:
         """Find the most recently modified JSONL in the project dir."""
@@ -342,17 +348,31 @@ class JsonlWatcher:
         r'<(local-command-\w+|command-name)\b')
 
     def get_last_user_message(self) -> Optional[str]:
-        """Read the JSONL backwards to find the most recent user text message."""
+        """Find the most recent user text message written AFTER the last begin_turn().
+
+        Only reads new JSONL entries (after self._pos) to avoid re-emitting
+        stale messages from earlier in the conversation.
+        """
         f = self._file or self._find_active_jsonl()
         if not f or not f.exists():
             log.info(f"get_last_user_message: no file (file={self._file})")
             return None
-        log.info(f"get_last_user_message: reading {f.name} ({f.stat().st_size} bytes)")
         try:
-            lines = f.read_text(encoding='utf-8', errors='replace').strip().split('\n')
+            size = f.stat().st_size
+        except OSError:
+            return None
+        if size <= self._pos:
+            log.info(f"get_last_user_message: no new data (pos={self._pos}, size={size})")
+            return None
+        log.info(f"get_last_user_message: reading {f.name} from pos={self._pos} ({size - self._pos} new bytes)")
+        try:
+            with open(f, 'r', encoding='utf-8', errors='replace') as fh:
+                fh.seek(self._pos)
+                new_data = fh.read()
         except OSError as e:
             log.info(f"get_last_user_message: OSError {e}")
             return None
+        lines = new_data.strip().split('\n')
         user_count = 0
         for line in reversed(lines):
             try:
@@ -380,7 +400,7 @@ class JsonlWatcher:
                             return text
             if user_count >= 3:
                 break
-        log.info(f"get_last_user_message: no text user message found in {user_count} user entries")
+        log.info(f"get_last_user_message: no text user message found in {user_count} new entries")
         return None
 
 
