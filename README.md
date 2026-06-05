@@ -262,4 +262,4 @@ echo '{"cmd":"ping"}' | python3 monitor.py
 
 ## License
 
-Proprietary. Copyright Positronic AI.
+[Business Source License 1.1](LICENSE). Free for non-production use. Production use requires a [commercial license](https://lit.ai/lit-bridge). Converts to Apache 2.0 after 4 years.

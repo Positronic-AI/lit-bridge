@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lit-bridge"
+version = "0.1.0"
+description = "Structured bridge between your application and interactive AI CLIs"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Positronic AI", email = "hello@positronic.ai"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+keywords = ["ai", "cli", "claude", "tmux", "terminal", "bridge"]
+
+[project.urls]
+Homepage = "https://lit.ai/lit-bridge"
+Repository = "https://github.com/Positronic-AI/lit-bridge"
+Issues = "https://github.com/Positronic-AI/lit-bridge/issues"
+Licensing = "https://lit.ai/lit-bridge#licensing"
+
+[project.scripts]
+lit-bridge = "monitor:main"
+
+[tool.setuptools]
+py-modules = ["monitor", "tmux_session"]
+
+[tool.setuptools.packages.find]
+include = ["parsers*"]
