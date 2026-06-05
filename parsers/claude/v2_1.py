@@ -31,7 +31,10 @@ class ClaudeV21Parser(TUIParser):
     RE_TOOL_HEADER = re.compile(r'^\s*●\s+(Reading|Writing|Editing|Running|Searching|Listing)\s')
     RE_TOOL_CALL_START = re.compile(r'^([A-Z]\w*)\(')
     RE_TOKEN_STATS = re.compile(r'\(.*?[↓↑]\s*[\d.]+k?\s*tokens?.*?\)')
-    RE_CONVERSATION_PICKER = re.compile(r'^\s*[●○◯]\s+\S.*(?:↑/↓|to select|Enter to view|\d+[ms]\d*s?)')
+    RE_CONVERSATION_PICKER = re.compile(
+        r'^\s*[●○◯]\s+\S.*(?:↑/↓|to select|Enter to view|\d+[ms]\d*s?)'
+        r'|^\s*[●○◯]\s*(?:Explore|Plan|main)\b'
+    )
     RE_COMPACT_PROGRESS = re.compile(r'^\d+%\s+until\s+auto-compact')
 
     DIALOG_STRINGS = [
@@ -303,16 +306,21 @@ class ClaudeV21Parser(TUIParser):
             s = lines[content_end - 1].strip()
             if (not s or
                     self.RE_SEPARATOR.match(s) or
-                    s.startswith('❯') or
+                    '─' * 10 in s or
+                    '❯' in s or
                     self.RE_STATUS.match(s) or
                     self.RE_CONVERSATION_PICKER.match(s) or
+                    s.startswith('○') or s.startswith('◯') or
                     'Claude Code' in s or
                     'auto-compact' in s or
                     'bypass permissions' in s or
                     'esc to interrupt' in s or
                     'paste again to expand' in s or
                     'Run /doctor' in s or
-                    'Auto-update failed' in s):
+                    'Auto-update failed' in s or
+                    'context used' in s or
+                    'to select' in s or
+                    'Enter to view' in s):
                 content_end -= 1
             else:
                 break
@@ -336,10 +344,11 @@ class ClaudeV21Parser(TUIParser):
                     start_idx = i
                     break
             if start_idx is not None:
+                # Find the LAST ✻ marker — monitor-based responses have
+                # multiple sub-turns, each ending with ✻.
                 for i in range(start_idx + 1, content_end):
                     if self.RE_COMPLETION.match(lines[i].strip()):
                         end_idx = i + 1
-                        break
 
         # Strategy 2: Bullet counting — works when no ❯ is visible
         # (e.g., user input scrolled off in a very long response).
@@ -353,7 +362,6 @@ class ClaudeV21Parser(TUIParser):
 
                 if start_idx is not None and self.RE_COMPLETION.match(line.strip()):
                     end_idx = i + 1
-                    break
 
         # Strategy 3: Needle search — find sent message text as landmark
         # when scrollback truncated too many bullets.  Search from
@@ -376,7 +384,6 @@ class ClaudeV21Parser(TUIParser):
                     for i in range(start_idx + 1, content_end):
                         if self.RE_COMPLETION.match(lines[i].strip()):
                             end_idx = i + 1
-                            break
 
         # Pre-response thinking or compaction: no ● yet but a spinner
         # is visible.  Scan a few lines — compaction puts a progress

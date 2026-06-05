@@ -128,10 +128,11 @@ def find_cli(name: str) -> str:
     return path
 
 
-def _cc_project_dir(working_dir: str) -> Path:
+def _cc_project_dir(working_dir: str, config_dir: str = None) -> Path:
     """Derive Claude Code's project directory from a working directory path."""
     slug = re.sub(r'[^a-zA-Z0-9]', '-', working_dir.lstrip('/'))
-    return Path.home() / ".claude" / "projects" / f"-{slug}"
+    base = Path(config_dir) if config_dir else (Path.home() / ".claude")
+    return base / "projects" / f"-{slug}"
 
 
 class JsonlWatcher:
@@ -409,7 +410,7 @@ class ManagedSession:
 
     def __init__(self, name: str, tmux: TmuxSession, parser: TUIParser,
                  working_dir: str = None, channel_id: str = None,
-                 team: str = None):
+                 team: str = None, config_dir: str = None):
         self.name = name
         self.tmux = tmux
         self.parser = parser
@@ -423,8 +424,10 @@ class ManagedSession:
         self._jsonl_watcher: Optional[JsonlWatcher] = None
         self._claude_session_id: Optional[str] = None
         self._last_active: float = time.monotonic()
+        self._paused: bool = False
+        self._yielded: str = ""
         if working_dir:
-            project_dir = _cc_project_dir(working_dir)
+            project_dir = _cc_project_dir(working_dir, config_dir)
             self._jsonl_watcher = JsonlWatcher(project_dir)
             log.info(f"[{name}] JSONL watcher: {project_dir}")
 
@@ -530,9 +533,10 @@ class Monitor:
 
         # Resume from a previously reaped idle session
         reaped = self._reaped_sessions.pop(session_key, None)
-        if reaped and reaped.get("session_id"):
-            cli_args.extend(["--resume", reaped["session_id"]])
-            log.info(f"[{session_key}] Resuming from reaped session {reaped['session_id']}")
+        resume_session_id = reaped.get("session_id") if reaped else None
+        if resume_session_id:
+            cli_args.extend(["--resume", resume_session_id])
+            log.info(f"[{session_key}] Resuming from reaped session {resume_session_id}")
 
         full_cmd = [cli_path] + cli_args
         tmux_session_name = sanitize_name(name)
@@ -555,7 +559,8 @@ class Monitor:
                     old._observe_task.cancel()
                 log.info(f"[{session_key}] Evicted discovered session '{name}' (superseded)")
             ms = ManagedSession(session_key, orphan_tmux, parser, working_dir=working_dir,
-                                channel_id=channel_id, team=team)
+                                channel_id=channel_id, team=team,
+                                config_dir=env_vars.get("CLAUDE_CONFIG_DIR"))
             self.sessions[session_key] = ms
             capture = await orphan_tmux.capture_pane(visible_only=True)
             ms.state = parser.detect_state(capture)
@@ -586,7 +591,8 @@ class Monitor:
                 return
 
         ms = ManagedSession(session_key, tmux, parser, working_dir=working_dir,
-                            channel_id=channel_id, team=team)
+                            channel_id=channel_id, team=team,
+                            config_dir=env_vars.get("CLAUDE_CONFIG_DIR"))
         self.sessions[session_key] = ms
 
         if win_label:
@@ -598,6 +604,16 @@ class Monitor:
         # Auto-dismiss startup dialogs
         for attempt in range(5):
             if not await tmux.is_alive():
+                # If we were resuming, retry without --resume (session may be stale)
+                if resume_session_id:
+                    log.info(f"[{session_key}] Resume failed — retrying without --resume")
+                    await tmux.kill()
+                    del self.sessions[session_key]
+                    fresh_args = [a for a in cli_args if a != "--resume" and a != resume_session_id]
+                    retry_cmd = dict(cmd)
+                    retry_cmd["args"] = fresh_args
+                    await self._cmd_create(retry_cmd)
+                    return
                 self._emit_error(session_key, "session died during startup")
                 await tmux.kill()
                 del self.sessions[session_key]
@@ -616,6 +632,15 @@ class Monitor:
             await asyncio.sleep(2.0)
 
         if not await tmux.is_alive():
+            if resume_session_id:
+                log.info(f"[{session_key}] Resume failed (post-startup) — retrying without --resume")
+                await tmux.kill()
+                del self.sessions[session_key]
+                fresh_args = [a for a in cli_args if a != "--resume" and a != resume_session_id]
+                retry_cmd = dict(cmd)
+                retry_cmd["args"] = fresh_args
+                await self._cmd_create(retry_cmd)
+                return
             self._emit_error(session_key, "session died after startup")
             await tmux.kill()
             del self.sessions[session_key]
@@ -650,6 +675,20 @@ class Monitor:
             self._emit({"session": sk, "event": "state",
                          "from": ms.state.value, "to": "dead"})
             return
+
+        # Emit boundary for previous turn (message-boundary completion)
+        if getattr(ms, '_yielded', '') and ms.channel_id:
+            evt = {"session": sk, "event": "boundary",
+                   "content": ms._yielded}
+            if ms.channel_id:
+                evt["channel_id"] = ms.channel_id
+            if ms.team:
+                evt["team"] = ms.team
+            self._emit(evt)
+            log.info(f"[{sk}] Boundary: {len(ms._yielded)} chars")
+            ms.observing = False
+            ms._yielded = ""
+            ms._paused = False
 
         # Wait for session to become ready (handles startup rendering + organic responses)
         for attempt in range(20):
@@ -855,14 +894,25 @@ class Monitor:
                     prev_state = new_state
                     ms.state = new_state
 
-                # Track last active time for idle reaping
-                if new_state != SessionState.IDLE or ms.observing:
+                # Track last active time for idle reaping.
+                # Paused channel sessions are genuinely idle — don't keep them alive.
+                if new_state != SessionState.IDLE or (ms.observing and not ms._paused):
                     ms._last_active = now
 
-                # Idle reaping: kill sessions idle too long, store for --resume
-                if (not ms.observing and
+                # Idle reaping: kill sessions idle too long, store for --resume.
+                # Channel sessions stay observing=True but become reapable once paused.
+                reapable = (not ms.observing) or (ms._paused and new_state == SessionState.IDLE)
+                if (reapable and
                         new_state == SessionState.IDLE and
                         (now - ms._last_active) > IDLE_REAP_TIMEOUT):
+                    # Emit boundary with accumulated content before reaping
+                    if getattr(ms, '_yielded', '') and ms.channel_id:
+                        b_evt = {"session": ms.name, "event": "boundary",
+                                 "content": ms._yielded,
+                                 "channel_id": ms.channel_id}
+                        if ms.team:
+                            b_evt["team"] = ms.team
+                        self._emit(b_evt)
                     session_id = None
                     if ms._jsonl_watcher:
                         session_id = ms._jsonl_watcher.get_session_id()
@@ -945,11 +995,18 @@ class Monitor:
                         after_lines = full_capture.split('\n')[last_bullet_line:]
                         for ln in after_lines:
                             if re.match(r'^\s*✻\s', ln):
-                                turn_confirmed = not re.search(r'✻\s+.*…', ln)
+                                # Not confirmed if still running (trailing …)
+                                # or if monitors are still active
+                                if re.search(r'✻\s+.*…', ln):
+                                    turn_confirmed = False
+                                elif re.search(r'monitor.*running', ln, re.IGNORECASE):
+                                    turn_confirmed = False
+                                else:
+                                    turn_confirmed = True
                                 break
 
                     if response != ms._yielded:
-                        has_bullet = bool(re.match(r'^\s*●\s', response))
+                        has_bullet = bool(re.search(r'^\s*●\s', response, re.MULTILINE))
                         evt = {"session": ms.name, "event": "replace",
                                "text": response,
                                "organic": ms._is_organic}
@@ -963,6 +1020,7 @@ class Monitor:
                         # chrome streams for UX but must not be saved.
                         if has_bullet:
                             ms._yielded = response
+                            ms._paused = False
                         last_response_change = now
 
                     # JSONL watcher: drain events, keep metadata
@@ -987,9 +1045,16 @@ class Monitor:
                     has_active_spinner = any(
                         ms.parser.RE_SPINNER_ACTIVE.match(ln)
                         for ln in (ms._yielded or '').split('\n'))
+                    # "N monitor(s) still running" in the ✻ line or
+                    # "N monitor" in the status bar means the CLI is
+                    # idle between monitor events — not truly complete.
+                    has_active_monitor = bool(re.search(
+                        r'monitor.*running|\d+\s+monitor', visible, re.IGNORECASE))
                     if (new_state == SessionState.IDLE and turn_confirmed
                             and prompt_visible
-                            and not has_active_spinner):
+                            and not has_active_spinner
+                            and not has_active_monitor
+                            and not ms._paused):
                         if idle_confirmed_since == 0.0:
                             idle_confirmed_since = now
                             idle_confirmed_content = ms._yielded
@@ -1015,24 +1080,40 @@ class Monitor:
                                     ms._yielded = response
                             if ms._yielded:
                                 compact_pct_now = _parse_compact_pct(visible)
-                                evt = {"session": ms.name,
-                                       "event": "complete",
-                                       "total_length": len(ms._yielded),
-                                       "content": ms._yielded,
-                                       "organic": ms._is_organic,
-                                       "compact_pct_start": getattr(ms, '_compact_pct_start', None),
-                                       "compact_pct_end": compact_pct_now}
                                 if ms.channel_id:
-                                    evt["channel_id"] = ms.channel_id
-                                if ms.team:
-                                    evt["team"] = ms.team
-                                self._emit(evt)
-                                ms.observing = False
-                                idle_confirmed_since = 0.0
-                                idle_confirmed_content = ""
-                                last_observe_complete = now
-                                log.info(f"[{ms.name}] Response complete ({len(ms._yielded)} chars, "
-                                         f"compact {getattr(ms, '_compact_pct_start', '?')}%→{compact_pct_now}%)")
+                                    # Channel sessions: emit paused, keep observing
+                                    evt = {"session": ms.name,
+                                           "event": "paused",
+                                           "total_length": len(ms._yielded),
+                                           "content": ms._yielded,
+                                           "organic": ms._is_organic,
+                                           "compact_pct_start": getattr(ms, '_compact_pct_start', None),
+                                           "compact_pct_end": compact_pct_now,
+                                           "channel_id": ms.channel_id}
+                                    if ms.team:
+                                        evt["team"] = ms.team
+                                    self._emit(evt)
+                                    ms._paused = True
+                                    idle_confirmed_since = 0.0
+                                    idle_confirmed_content = ""
+                                    last_observe_complete = now
+                                    log.info(f"[{ms.name}] Response paused ({len(ms._yielded)} chars)")
+                                else:
+                                    # Standalone sessions: emit complete, stop observing
+                                    evt = {"session": ms.name,
+                                           "event": "complete",
+                                           "total_length": len(ms._yielded),
+                                           "content": ms._yielded,
+                                           "organic": ms._is_organic,
+                                           "compact_pct_start": getattr(ms, '_compact_pct_start', None),
+                                           "compact_pct_end": compact_pct_now}
+                                    self._emit(evt)
+                                    ms.observing = False
+                                    idle_confirmed_since = 0.0
+                                    idle_confirmed_content = ""
+                                    last_observe_complete = now
+                                    log.info(f"[{ms.name}] Response complete ({len(ms._yielded)} chars, "
+                                             f"compact {getattr(ms, '_compact_pct_start', '?')}%→{compact_pct_now}%)")
                                 if ms._jsonl_watcher:
                                     meta = ms._jsonl_watcher.get_turn_metadata()
                                     if meta:
@@ -1046,7 +1127,9 @@ class Monitor:
                     # Use short timeout if truly complete (prompt visible),
                     # long timeout otherwise (tool calls can stall response
                     # text for 10-20s while the CLI thinks).
-                    if ms._yielded and ms.observing:
+                    # Skip quiescence entirely when monitors are active —
+                    # they can pause for minutes between events.
+                    if ms._yielded and ms.observing and not has_active_monitor and not ms._paused:
                         truly_confirmed = turn_confirmed and prompt_visible
                         q_timeout = (QUIESCENCE_TIMEOUT if truly_confirmed
                                      else QUIESCENCE_UNCONFIRMED_TIMEOUT)
@@ -1058,25 +1141,35 @@ class Monitor:
                                              "event": "tool_result_done"})
                                 ms._streaming_tool_output = False
                             compact_pct_now = _parse_compact_pct(visible)
-                            q_evt = {"session": ms.name, "event": "complete",
-                                    "total_length": len(ms._yielded),
-                                    "content": ms._yielded,
-                                    "reason": "quiescence",
-                                    "organic": ms._is_organic,
-                                    "compact_pct_start": getattr(ms, '_compact_pct_start', None),
-                                    "compact_pct_end": compact_pct_now}
                             if ms.channel_id:
-                                q_evt["channel_id"] = ms.channel_id
-                            if ms.team:
-                                q_evt["team"] = ms.team
-                            self._emit(q_evt)
-                            ms.observing = False
-                            # Longer cooldown after quiescence — the TUI state
-                            # may still flicker, causing false re-triggers.
-                            last_observe_complete = now + 15.0
-                            log.info(f"[{ms.name}] Response complete "
-                                     f"(quiescence, confirmed={turn_confirmed}, "
-                                     f"compact {getattr(ms, '_compact_pct_start', '?')}%→{compact_pct_now}%)")
+                                q_evt = {"session": ms.name, "event": "paused",
+                                        "total_length": len(ms._yielded),
+                                        "content": ms._yielded,
+                                        "reason": "quiescence",
+                                        "organic": ms._is_organic,
+                                        "compact_pct_start": getattr(ms, '_compact_pct_start', None),
+                                        "compact_pct_end": compact_pct_now,
+                                        "channel_id": ms.channel_id}
+                                if ms.team:
+                                    q_evt["team"] = ms.team
+                                self._emit(q_evt)
+                                ms._paused = True
+                                last_observe_complete = now + 15.0
+                                log.info(f"[{ms.name}] Response paused (quiescence)")
+                            else:
+                                q_evt = {"session": ms.name, "event": "complete",
+                                        "total_length": len(ms._yielded),
+                                        "content": ms._yielded,
+                                        "reason": "quiescence",
+                                        "organic": ms._is_organic,
+                                        "compact_pct_start": getattr(ms, '_compact_pct_start', None),
+                                        "compact_pct_end": compact_pct_now}
+                                self._emit(q_evt)
+                                ms.observing = False
+                                last_observe_complete = now + 15.0
+                                log.info(f"[{ms.name}] Response complete "
+                                         f"(quiescence, confirmed={turn_confirmed}, "
+                                         f"compact {getattr(ms, '_compact_pct_start', '?')}%→{compact_pct_now}%)")
                             if ms._jsonl_watcher:
                                 meta = ms._jsonl_watcher.get_turn_metadata()
                                 if meta:
