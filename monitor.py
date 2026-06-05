@@ -690,26 +690,18 @@ class Monitor:
             ms._yielded = ""
             ms._paused = False
 
-        # Wait for session to become ready (handles startup rendering + organic responses)
-        for attempt in range(20):
-            visible = await ms.tmux.capture_pane(visible_only=True)
-            current_state = ms.parser.detect_state(visible)
+        # Check session state but don't block — send regardless, like typing in tmux.
+        # Dialog state is the only hard block (needs keystroke, not text input).
+        visible = await ms.tmux.capture_pane(visible_only=True)
+        current_state = ms.parser.detect_state(visible)
 
-            if current_state == SessionState.DIALOG:
-                self._emit({"session": sk, "event": "error",
-                             "message": "session is in dialog state, use keystroke command"})
-                return
-
-            if current_state in (SessionState.IDLE, SessionState.THINKING):
-                break
-
-            if attempt == 0:
-                log.info(f"[{sk}] Waiting for idle (currently {current_state.value})")
-            await asyncio.sleep(0.5)
-        else:
+        if current_state == SessionState.DIALOG:
             self._emit({"session": sk, "event": "error",
-                         "message": f"session is {current_state.value}, not ready after 10s"})
+                         "message": "session is in dialog state, use keystroke command"})
             return
+
+        if current_state not in (SessionState.IDLE, SessionState.THINKING):
+            log.info(f"[{sk}] Sending into {current_state.value} state (CLI will queue input)")
 
         full_capture = await ms.tmux.capture_pane()
         baseline_count = ms.parser.count_assistant_messages(full_capture)
@@ -733,6 +725,9 @@ class Monitor:
         ms._last_tool_output_content = ""
         ms._is_organic = False
         ms._compact_pct_start = _parse_compact_pct(visible)
+        ms._baseline_completion_count = sum(
+            1 for ln in full_capture.split('\n')
+            if re.match(r'^\s*✻\s', ln))
         ms.observing = True
 
         try:
@@ -983,11 +978,13 @@ class Monitor:
 
                     # Detect definitive turn completion: a line-start ✻
                     # marker (e.g. "✻ Brewed for 9s") after the last
-                    # line-start ● block.  Must match at line start to
-                    # avoid false positives when response prose contains
-                    # these Unicode characters mid-text.
+                    # line-start ● block.  Only counts ✻ markers that are
+                    # NEW since send time (baseline) to avoid false positives
+                    # from previous turns' completion markers.
                     turn_confirmed = False
                     last_bullet_line = -1
+                    completion_count = 0
+                    baseline_completions = getattr(ms, '_baseline_completion_count', 0)
                     for li, ln in enumerate(full_capture.split('\n')):
                         if re.match(r'^\s*●\s', ln) and not ms.parser.RE_CONVERSATION_PICKER.match(ln.strip()):
                             last_bullet_line = li
@@ -995,6 +992,13 @@ class Monitor:
                         after_lines = full_capture.split('\n')[last_bullet_line:]
                         for ln in after_lines:
                             if re.match(r'^\s*✻\s', ln):
+                                completion_count += 1
+                                # Only consider NEW ✻ markers (after baseline)
+                                total_completions = sum(
+                                    1 for l in full_capture.split('\n')
+                                    if re.match(r'^\s*✻\s', l))
+                                if total_completions <= baseline_completions:
+                                    break
                                 # Not confirmed if still running (trailing …)
                                 # or if monitors are still active
                                 if re.search(r'✻\s+.*…', ln):
