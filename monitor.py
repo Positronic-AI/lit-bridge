@@ -730,6 +730,7 @@ class Monitor:
         ms._streaming_tool_output = False
         ms._last_tool_output_content = ""
         ms._is_organic = False
+        ms._jsonl_content_set = False
         ms._compact_pct_start = _parse_compact_pct(visible)
         ms._baseline_completion_count = sum(
             1 for ln in full_capture.split('\n')
@@ -1029,7 +1030,8 @@ class Monitor:
                         # Only persist content with a response bullet as
                         # the authoritative response — spinner/thinking
                         # chrome streams for UX but must not be saved.
-                        if has_bullet:
+                        # Don't overwrite JSONL-sourced content — it's authoritative.
+                        if has_bullet and not getattr(ms, '_jsonl_content_set', False):
                             ms._yielded = response
                             ms._paused = False
                         last_response_change = now
@@ -1042,6 +1044,7 @@ class Monitor:
                                 jsonl_content = tool_evt.get("content", "")
                                 if jsonl_content:
                                     ms._yielded = jsonl_content
+                                    ms._jsonl_content_set = True
                                     ms._paused = False
                                     last_response_change = now
                                 log.info(f"[{ms.name}] JSONL: end_turn — "
