@@ -284,7 +284,8 @@ class ClaudeV21Parser(TUIParser):
         return "\n\n".join(m.content for m in new_msgs)
 
     def extract_raw_response(self, baseline_count: int, capture: str,
-                             sent_content: str = None) -> str:
+                             sent_content: str = None,
+                             baseline_completions: int = 0) -> str:
         """Faithful capture: everything from the first new ● to ✻ or end.
 
         Strips trailing TUI chrome (separator, prompt, status bar) so
@@ -381,6 +382,26 @@ class ClaudeV21Parser(TUIParser):
                         break
                 if start_idx is not None:
                     end_idx = content_end
+                    for i in range(start_idx + 1, content_end):
+                        if self.RE_COMPLETION.match(lines[i].strip()):
+                            end_idx = i + 1
+
+        # Strategy 4: Last-bullet fallback — when scrollback overflow hides
+        # the user prompt and baseline bullets.  Only triggers when a NEW ✻
+        # marker exists (total completions > baseline_completions), preventing
+        # extraction of stale content from previous turns.
+        if start_idx is None:
+            total_completions = sum(
+                1 for ln in lines[:content_end]
+                if self.RE_COMPLETION.match(ln.strip()))
+            if total_completions > baseline_completions:
+                last_bullet_idx = None
+                for i in range(content_end - 1, -1, -1):
+                    if self.RE_RESPONSE.match(lines[i].strip()):
+                        last_bullet_idx = i
+                        break
+                if last_bullet_idx is not None:
+                    start_idx = last_bullet_idx
                     for i in range(start_idx + 1, content_end):
                         if self.RE_COMPLETION.match(lines[i].strip()):
                             end_idx = i + 1

@@ -217,6 +217,8 @@ class JsonlWatcher:
 
             if entry.get('type') == 'assistant':
                 msg = entry.get('message', {})
+                if msg.get('stop_reason') == 'end_turn':
+                    events.append({"event": "turn_complete"})
                 content_blocks = msg.get('content', [])
                 if not isinstance(content_blocks, list):
                     continue
@@ -973,7 +975,8 @@ class Monitor:
                     full_capture = await ms.tmux.capture_pane()
                     response = ms.parser.extract_raw_response(
                         ms._baseline_count, full_capture,
-                        sent_content=getattr(ms, '_sent_content', None))
+                        sent_content=getattr(ms, '_sent_content', None),
+                        baseline_completions=getattr(ms, '_baseline_completion_count', 0))
                     response = _unwrap_tmux_lines(response, getattr(ms, '_pane_width', 0))
 
                     # Detect definitive turn completion: a line-start ✻
@@ -1027,9 +1030,13 @@ class Monitor:
                             ms._paused = False
                         last_response_change = now
 
-                    # JSONL watcher: drain events, keep metadata
+                    # JSONL watcher: drain events, detect turn_complete
                     if ms._jsonl_watcher:
                         for tool_evt in ms._jsonl_watcher.poll():
+                            if tool_evt.get("event") == "turn_complete":
+                                turn_confirmed = True
+                                log.info(f"[{ms.name}] JSONL: end_turn — turn confirmed")
+                                continue
                             if tool_evt.get("event") in (
                                     "tool_use", "tool_result"):
                                 continue
@@ -1055,7 +1062,6 @@ class Monitor:
                     has_active_monitor = bool(re.search(
                         r'monitor.*running|\d+\s+monitor', visible, re.IGNORECASE))
                     if (new_state == SessionState.IDLE and turn_confirmed
-                            and prompt_visible
                             and not has_active_spinner
                             and not has_active_monitor
                             and not ms._paused):
@@ -1072,7 +1078,8 @@ class Monitor:
                                 full_capture = await ms.tmux.capture_pane()
                                 response = ms.parser.extract_raw_response(
                                     ms._baseline_count, full_capture,
-                                    sent_content=getattr(ms, '_sent_content', None))
+                                    sent_content=getattr(ms, '_sent_content', None),
+                                    baseline_completions=getattr(ms, '_baseline_completion_count', 0))
                                 response = _unwrap_tmux_lines(response, getattr(ms, '_pane_width', 0))
                                 # Only save as final content if it has a real
                                 # response bullet — spinner/thinking chrome
@@ -1134,7 +1141,7 @@ class Monitor:
                     # Skip quiescence entirely when monitors are active —
                     # they can pause for minutes between events.
                     if ms._yielded and ms.observing and not has_active_monitor and not ms._paused:
-                        truly_confirmed = turn_confirmed and prompt_visible
+                        truly_confirmed = turn_confirmed
                         q_timeout = (QUIESCENCE_TIMEOUT if truly_confirmed
                                      else QUIESCENCE_UNCONFIRMED_TIMEOUT)
                         if ((now - last_response_change) > q_timeout and
@@ -1391,10 +1398,21 @@ class Monitor:
                     else:
                         channel_id = win_name
                 working_dir = await tmux.get_pane_cwd() or None
+                # Derive CLAUDE_CONFIG_DIR from session name convention:
+                # lit-{username}-{agent_id} → ~/.claude-{agent_id}
+                config_dir = None
+                parts = session_name.split('-', 2)
+                if len(parts) >= 3:
+                    agent_id = parts[2]
+                    user_home = str(Path(f"/home/{parts[1]}"))
+                    candidate = f"{user_home}/.claude-{agent_id}"
+                    if Path(candidate).is_dir():
+                        config_dir = candidate
                 key = self._session_key(session_name, channel_id)
                 ms = ManagedSession(key, tmux, parser,
                                     working_dir=working_dir,
-                                    channel_id=channel_id, team=team)
+                                    channel_id=channel_id, team=team,
+                                    config_dir=config_dir)
                 ms.state = parser.detect_state(visible)
                 ms._observe_task = asyncio.create_task(self._observe_loop(ms))
                 self.sessions[key] = ms
