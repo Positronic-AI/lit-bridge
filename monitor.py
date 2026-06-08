@@ -169,6 +169,7 @@ class JsonlWatcher:
         else:
             self._pos = 0
         self._emitted_tool_ids.clear()
+        self._turn_text_parts: List[str] = []
 
     def poll(self) -> List[dict]:
         """Read new JSONL entries and return tool events."""
@@ -217,31 +218,34 @@ class JsonlWatcher:
 
             if entry.get('type') == 'assistant':
                 msg = entry.get('message', {})
-                if msg.get('stop_reason') == 'end_turn':
-                    events.append({"event": "turn_complete"})
                 content_blocks = msg.get('content', [])
-                if not isinstance(content_blocks, list):
-                    continue
-                for block in content_blocks:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get('type') == 'tool_use':
-                        tool_id = block.get('id', '')
-                        if tool_id not in self._emitted_tool_ids:
-                            self._emitted_tool_ids.add(tool_id)
-                            events.append({
-                                "event": "tool_use",
-                                "tool_use_id": tool_id,
-                                "name": block.get('name', ''),
-                                "input": block.get('input', {}),
-                            })
-                    elif block.get('type') == 'text':
-                        text = block.get('text', '').strip()
-                        if text:
-                            events.append({
-                                "event": "jsonl_text",
-                                "text": text,
-                            })
+                if isinstance(content_blocks, list):
+                    for block in content_blocks:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get('type') == 'tool_use':
+                            tool_id = block.get('id', '')
+                            if tool_id not in self._emitted_tool_ids:
+                                self._emitted_tool_ids.add(tool_id)
+                                events.append({
+                                    "event": "tool_use",
+                                    "tool_use_id": tool_id,
+                                    "name": block.get('name', ''),
+                                    "input": block.get('input', {}),
+                                })
+                        elif block.get('type') == 'text':
+                            text = block.get('text', '').strip()
+                            if text:
+                                self._turn_text_parts.append(text)
+                                events.append({
+                                    "event": "jsonl_text",
+                                    "text": text,
+                                })
+                if msg.get('stop_reason') == 'end_turn':
+                    full_text = '\n\n'.join(self._turn_text_parts)
+                    events.append({"event": "turn_complete",
+                                   "content": full_text})
+                    self._turn_text_parts = []
             elif entry.get('type') == 'user':
                 msg = entry.get('message', {})
                 content_blocks = msg.get('content', [])
@@ -1035,7 +1039,13 @@ class Monitor:
                         for tool_evt in ms._jsonl_watcher.poll():
                             if tool_evt.get("event") == "turn_complete":
                                 turn_confirmed = True
-                                log.info(f"[{ms.name}] JSONL: end_turn — turn confirmed")
+                                jsonl_content = tool_evt.get("content", "")
+                                if jsonl_content:
+                                    ms._yielded = jsonl_content
+                                    ms._paused = False
+                                    last_response_change = now
+                                log.info(f"[{ms.name}] JSONL: end_turn — "
+                                         f"turn confirmed, {len(jsonl_content)} chars")
                                 continue
                             if tool_evt.get("event") in (
                                     "tool_use", "tool_result"):
