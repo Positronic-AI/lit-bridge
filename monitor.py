@@ -731,6 +731,7 @@ class Monitor:
         ms._last_tool_output_content = ""
         ms._is_organic = False
         ms._jsonl_content_set = False
+        ms._turn_confirmed = False
         ms._compact_pct_start = _parse_compact_pct(visible)
         ms._baseline_completion_count = sum(
             1 for ln in full_capture.split('\n')
@@ -989,7 +990,7 @@ class Monitor:
                     # line-start ● block.  Only counts ✻ markers that are
                     # NEW since send time (baseline) to avoid false positives
                     # from previous turns' completion markers.
-                    turn_confirmed = False
+                    turn_confirmed = getattr(ms, '_turn_confirmed', False)
                     last_bullet_line = -1
                     completion_count = 0
                     baseline_completions = getattr(ms, '_baseline_completion_count', 0)
@@ -1015,6 +1016,7 @@ class Monitor:
                                     turn_confirmed = False
                                 else:
                                     turn_confirmed = True
+                                    ms._turn_confirmed = True
                                 break
 
                     if response != ms._yielded:
@@ -1041,6 +1043,7 @@ class Monitor:
                         for tool_evt in ms._jsonl_watcher.poll():
                             if tool_evt.get("event") == "turn_complete":
                                 turn_confirmed = True
+                                ms._turn_confirmed = True
                                 jsonl_content = tool_evt.get("content", "")
                                 if jsonl_content:
                                     ms._yielded = jsonl_content
