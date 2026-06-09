@@ -301,7 +301,9 @@ async def observe_loop(
                     elif ms._yielded != idle_confirmed_content:
                         idle_confirmed_since = now
                         idle_confirmed_content = ms._yielded
-                    if (now - idle_confirmed_since) >= COMPLETION_DEBOUNCE:
+                    # JSONL fast path: end_turn is authoritative, skip debounce
+                    jsonl_confirmed = getattr(ms, '_jsonl_content_set', False)
+                    if (now - idle_confirmed_since) >= COMPLETION_DEBOUNCE or jsonl_confirmed:
                         if not ms._yielded:
                             await asyncio.sleep(0.5)
                             full_capture = await ms.tmux.capture_pane()
