@@ -5,7 +5,11 @@ No tmux, no Claude, no network — just regex against captured TUI snapshots.
 Run: python3 test_parser.py
 """
 
+import os
+import sys
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from parsers.claude import ClaudeV21Parser
 from parsers.base import SessionState
 

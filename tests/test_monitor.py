@@ -10,7 +10,7 @@ import json
 import sys
 import os
 
-MONITOR_DIR = os.path.dirname(os.path.abspath(__file__))
+MONITOR_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 async def read_event(proc, timeout=30.0):
@@ -31,7 +31,7 @@ async def send_cmd(proc, cmd):
 async def test_ping():
     """Test: ping → pong."""
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, os.path.join(MONITOR_DIR, "monitor.py"),
+        sys.executable, os.path.join(MONITOR_DIR, "server.py"),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -60,7 +60,7 @@ async def test_ping():
 async def test_create_and_send():
     """Test: create a Claude session, send a message, get chunks back."""
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, os.path.join(MONITOR_DIR, "monitor.py"),
+        sys.executable, os.path.join(MONITOR_DIR, "server.py"),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

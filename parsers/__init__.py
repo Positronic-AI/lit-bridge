@@ -2,7 +2,7 @@ from .base import TUIParser, TUIMessage, SessionState
 from .claude import ClaudeV21Parser
 from .registry import select_parser, register, supported_clis
 
-# Backward compat — monitor.py imports this name
+# Backward compat — server.py imports this name
 ClaudeTUIParser = ClaudeV21Parser
 
 __all__ = [
