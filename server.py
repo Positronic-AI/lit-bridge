@@ -371,6 +371,16 @@ class Monitor:
                          "message": "session is in dialog state, use keystroke command"})
             return
 
+        # Ctrl+O expanded transcript mode — CLI won't accept input.
+        # Check only the last 3 lines (footer area) to avoid matching
+        # against the string appearing in code/response content.
+        footer_lines = '\n'.join(visible.strip().split('\n')[-3:]).lower()
+        if 'showing detailed transcript' in footer_lines:
+            log.info(f"[{sk}] Blocked send — CLI is in Ctrl+O expanded mode")
+            self._emit({"session": sk, "event": "error",
+                         "message": "CLI is in expanded transcript mode (Ctrl+O). Toggle back to send messages."})
+            return
+
         if current_state not in (SessionState.IDLE, SessionState.THINKING):
             log.info(f"[{sk}] Sending into {current_state.value} state (CLI will queue input)")
 
