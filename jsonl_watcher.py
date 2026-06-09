@@ -112,12 +112,17 @@ class JsonlWatcher:
                             tool_id = block.get('id', '')
                             if tool_id not in self._emitted_tool_ids:
                                 self._emitted_tool_ids.add(tool_id)
+                                tool_name = block.get('name', '')
+                                tool_input = block.get('input', {})
                                 events.append({
                                     "event": "tool_use",
                                     "tool_use_id": tool_id,
-                                    "name": block.get('name', ''),
-                                    "input": block.get('input', {}),
+                                    "name": tool_name,
+                                    "input": tool_input,
                                 })
+                                self._turn_text_parts.append(
+                                    f"\x02TOOLJSON{json.dumps({'name': tool_name, 'input': tool_input})}\x03"
+                                )
                         elif block.get('type') == 'text':
                             text = block.get('text', '').strip()
                             if text:
@@ -157,6 +162,10 @@ class JsonlWatcher:
                             "tool_use_id": tool_id,
                             "content": content,
                         })
+                        safe_content = str(content).replace('\x02', '').replace('\x03', '')
+                        self._turn_text_parts.append(
+                            f"\x02RESULT\x03{safe_content}\x02/RESULT\x03"
+                        )
 
         if events:
             log.info(f"JSONL watcher: {len(events)} tool events from {self._file.name}")
