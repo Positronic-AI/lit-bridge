@@ -31,6 +31,18 @@ AUTO_OBSERVE_COOLDOWN = 1.5
 NO_PROGRESS_TIMEOUT = 90.0
 IDLE_REAP_TIMEOUT = 3600.0
 
+_CLI_ERROR_RE = re.compile(r'^Error:\s', re.MULTILINE)
+
+
+def _is_cli_error(content: str) -> bool:
+    """Check if yielded content is a CLI error, not a real response."""
+    if not content:
+        return False
+    lines = [l for l in content.strip().split('\n')
+             if not re.match(r'^\s*✻\s', l)]
+    remaining = '\n'.join(lines).strip()
+    return bool(_CLI_ERROR_RE.match(remaining))
+
 
 def _parse_compact_pct(capture: str) -> Optional[int]:
     """Extract the auto-compact percentage from visible capture."""
@@ -286,9 +298,14 @@ async def observe_loop(
                         last_response_change = now
 
                 # ── Completion: confirmed idle + debounce ──
-                has_active_spinner = any(
-                    ms.parser.RE_SPINNER_ACTIVE.match(ln)
-                    for ln in (ms._yielded or '').split('\n'))
+                # Only check for spinners in TUI-scraped content, not JSONL
+                # (JSONL content includes tool results with arbitrary text
+                # that can false-positive on spinner patterns like "· text…")
+                has_active_spinner = False
+                if not getattr(ms, '_jsonl_content_set', False):
+                    has_active_spinner = any(
+                        ms.parser.RE_SPINNER_ACTIVE.match(ln)
+                        for ln in (ms._yielded or '').split('\n'))
                 has_active_monitor = bool(re.search(
                     r'monitor.*running|\d+\s+monitor', visible, re.IGNORECASE))
                 if (new_state == SessionState.IDLE and turn_confirmed
@@ -318,8 +335,16 @@ async def observe_loop(
                                       "text": response})
                                 ms._yielded = response
                         if ms._yielded:
-                            compact_pct_now = _parse_compact_pct(visible)
-                            if ms.channel_id:
+                            if _is_cli_error(ms._yielded):
+                                emit({"session": ms.name, "event": "error",
+                                      "message": ms._yielded.strip()})
+                                ms.observing = False
+                                idle_confirmed_since = 0.0
+                                idle_confirmed_content = ""
+                                last_observe_complete = now
+                                log.warning(f"[{ms.name}] CLI error response: {ms._yielded.strip()!r}")
+                            elif ms.channel_id:
+                                compact_pct_now = _parse_compact_pct(visible)
                                 evt = {"session": ms.name,
                                        "event": "paused",
                                        "total_length": len(ms._yielded),
@@ -337,6 +362,7 @@ async def observe_loop(
                                 last_observe_complete = now
                                 log.info(f"[{ms.name}] Response paused ({len(ms._yielded)} chars)")
                             else:
+                                compact_pct_now = _parse_compact_pct(visible)
                                 evt = {"session": ms.name,
                                        "event": "complete",
                                        "total_length": len(ms._yielded),
@@ -372,8 +398,14 @@ async def observe_loop(
                             emit({"session": ms.name,
                                   "event": "tool_result_done"})
                             ms._streaming_tool_output = False
-                        compact_pct_now = _parse_compact_pct(visible)
-                        if ms.channel_id:
+                        if _is_cli_error(ms._yielded):
+                            emit({"session": ms.name, "event": "error",
+                                  "message": ms._yielded.strip()})
+                            ms.observing = False
+                            last_observe_complete = now
+                            log.warning(f"[{ms.name}] CLI error response (quiescence): {ms._yielded.strip()!r}")
+                        elif ms.channel_id:
+                            compact_pct_now = _parse_compact_pct(visible)
                             q_evt = {"session": ms.name, "event": "paused",
                                     "total_length": len(ms._yielded),
                                     "content": ms._yielded,
@@ -389,6 +421,7 @@ async def observe_loop(
                             last_observe_complete = now + 15.0
                             log.info(f"[{ms.name}] Response paused (quiescence)")
                         else:
+                            compact_pct_now = _parse_compact_pct(visible)
                             q_evt = {"session": ms.name, "event": "complete",
                                     "total_length": len(ms._yielded),
                                     "content": ms._yielded,
