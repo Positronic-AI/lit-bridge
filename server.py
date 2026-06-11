@@ -89,6 +89,7 @@ class ManagedSession:
         self.channel_id = channel_id
         self.team = team
         self.state = SessionState.STARTING
+        self.model: Optional[str] = None
         self.observing = False
         self._is_organic = False
         self._observe_task: Optional[asyncio.Task] = None
@@ -157,6 +158,15 @@ class Monitor:
 
     # ── Commands ────────────────────────────────────────────
 
+    @staticmethod
+    def _model_from_command(cmdline: str) -> Optional[str]:
+        """Extract --model value from a CLI command line / arg list."""
+        parts = cmdline.split() if isinstance(cmdline, str) else list(cmdline)
+        for i, p in enumerate(parts):
+            if p == "--model" and i + 1 < len(parts):
+                return parts[i + 1]
+        return None
+
     def _session_key(self, name: str, channel_id: str = None) -> str:
         return f"{name}:{channel_id}" if channel_id else name
 
@@ -181,7 +191,11 @@ class Monitor:
         if session_key in self.sessions:
             ms = self.sessions[session_key]
             if await ms.tmux.is_alive():
-                self._emit({"session": session_key, "event": "ready", "reused": True})
+                if ms.model is None:
+                    ms.model = self._model_from_command(
+                        await ms.tmux.get_pane_command())
+                self._emit({"session": session_key, "event": "ready",
+                            "reused": True, "model": ms.model})
                 return
             del self.sessions[session_key]
 
@@ -235,8 +249,11 @@ class Monitor:
             self.sessions[session_key] = ms
             capture = await orphan_tmux.capture_pane(visible_only=True)
             ms.state = parser.detect_state(capture)
+            ms.model = self._model_from_command(
+                await orphan_tmux.get_pane_command())
             ms._observe_task = asyncio.create_task(self._observe_loop(ms))
-            self._emit({"session": session_key, "event": "ready", "reused": True})
+            self._emit({"session": session_key, "event": "ready",
+                        "reused": True, "model": ms.model})
             return
 
         # Check if the tmux session already exists (in-memory or directly)
@@ -319,8 +336,11 @@ class Monitor:
 
         capture = await tmux.capture_pane(visible_only=True)
         ms.state = parser.detect_state(capture)
+        ms.model = self._model_from_command(cli_args)
 
-        self._emit({"session": session_key, "event": "ready", "state": ms.state.value})
+        self._emit({"session": session_key, "event": "ready",
+                    "state": ms.state.value, "model": ms.model,
+                    "resumed": resume_session_id is not None})
 
         # Start background observer
         ms._observe_task = asyncio.create_task(self._observe_loop(ms))
@@ -432,46 +452,72 @@ class Monitor:
         brief output but shouldn't be treated as a response turn.
         """
         name = cmd.get("session")
+        channel_id = cmd.get("channel_id")
+        session_key = self._session_key(name, channel_id)
         content = cmd.get("content", "")
 
-        ms = self.sessions.get(name)
+        ms = self.sessions.get(session_key)
+        if not ms and channel_id:
+            ms = self.sessions.get(name)
         if not ms:
-            self._emit_error(name, "session not found")
+            self._emit_error(session_key, "session not found")
             return
 
         try:
             await ms.tmux.send_message(content)
-            self._emit({"session": name, "event": "input_sent"})
+            self._emit({"session": ms.name, "event": "input_sent"})
         except RuntimeError as e:
-            self._emit_error(name, f"input failed: {e}")
+            self._emit_error(ms.name, f"input failed: {e}")
 
     async def _cmd_keystroke(self, cmd: dict):
         name = cmd.get("session")
+        channel_id = cmd.get("channel_id")
+        session_key = self._session_key(name, channel_id)
         keys = cmd.get("keys", [])
 
-        ms = self.sessions.get(name)
+        ms = self.sessions.get(session_key)
+        if not ms and channel_id:
+            ms = self.sessions.get(name)
         if not ms:
-            self._emit_error(name, "session not found")
+            self._emit_error(session_key, "session not found")
             return
 
         for key in keys:
             await ms.tmux.send_keys(key)
             await asyncio.sleep(0.1)
 
-        self._emit({"session": name, "event": "keystroke_sent", "keys": keys})
+        self._emit({"session": ms.name, "event": "keystroke_sent", "keys": keys})
 
     async def _cmd_kill(self, cmd: dict):
         name = cmd.get("session")
-        ms = self.sessions.get(name)
+        channel_id = cmd.get("channel_id")
+        session_key = self._session_key(name, channel_id)
+
+        ms = self.sessions.get(session_key)
+        if not ms and channel_id:
+            ms = self.sessions.get(name)
         if not ms:
-            self._emit_error(name, "session not found")
+            self._emit_error(session_key, "session not found")
             return
+
+        # Stash the CLI session id so the next create resumes the
+        # conversation (used for model switches: kill + recreate)
+        if cmd.get("store_resume"):
+            session_id = None
+            if ms._jsonl_watcher:
+                session_id = ms._jsonl_watcher.get_session_id()
+            self._reaped_sessions[ms.name] = {
+                "session_id": session_id,
+                "working_dir": ms.working_dir,
+            }
+            log.info(f"[{ms.name}] Killed with resume stash "
+                     f"(resume_id={session_id})")
 
         if ms._observe_task:
             ms._observe_task.cancel()
         await ms.tmux.kill()
-        del self.sessions[name]
-        self._emit({"session": name, "event": "killed"})
+        self.sessions.pop(ms.name, None)
+        self._emit({"session": ms.name, "event": "killed"})
 
     async def _cmd_list(self):
         sessions = []
@@ -748,6 +794,8 @@ class Monitor:
                                     channel_id=channel_id, team=team,
                                     config_dir=config_dir)
                 ms.state = parser.detect_state(visible)
+                ms.model = self._model_from_command(
+                    await tmux.get_pane_command())
                 ms._observe_task = asyncio.create_task(self._observe_loop(ms))
                 self.sessions[key] = ms
 

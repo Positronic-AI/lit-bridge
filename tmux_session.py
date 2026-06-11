@@ -167,6 +167,21 @@ class TmuxSession:
             f"tmux display-message -t {target} -p '#{{pane_current_path}}'")
         return stdout.strip() if rc == 0 else ""
 
+    async def get_pane_command(self) -> str:
+        """Full command line of the process running in the pane."""
+        target = shlex.quote(self._target)
+        rc, stdout, _ = await self._exec(
+            f"tmux display-message -t {target} -p '#{{pane_pid}}'")
+        pid = stdout.strip()
+        if rc != 0 or not pid:
+            return ""
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                return f.read().replace(b"\0", b" ").decode(
+                    "utf-8", errors="replace")
+        except OSError:
+            return ""
+
     async def is_alive(self) -> bool:
         if self.window_name:
             cmd = f"tmux list-windows -t {shlex.quote(self.session_name)} -F '#{{window_name}}'"
