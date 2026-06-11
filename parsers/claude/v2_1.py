@@ -390,17 +390,28 @@ class ClaudeV21Parser(TUIParser):
         # the user prompt and baseline bullets.  Only triggers when a NEW ✻
         # marker exists (total completions > baseline_completions), preventing
         # extraction of stale content from previous turns.
+        # Guard: the ● must appear AFTER the last baseline ✻ — otherwise
+        # it's from a previous turn and the new ✻ is just an error marker.
         if start_idx is None:
             total_completions = sum(
                 1 for ln in lines[:content_end]
                 if self.RE_COMPLETION.match(ln.strip()))
             if total_completions > baseline_completions:
+                # Find position of the last baseline ✻ marker
+                baseline_star_idx = -1
+                star_count = 0
+                for i, ln in enumerate(lines[:content_end]):
+                    if self.RE_COMPLETION.match(ln.strip()):
+                        star_count += 1
+                        if star_count <= baseline_completions:
+                            baseline_star_idx = i
                 last_bullet_idx = None
                 for i in range(content_end - 1, -1, -1):
                     if self.RE_RESPONSE.match(lines[i].strip()):
                         last_bullet_idx = i
                         break
-                if last_bullet_idx is not None:
+                if (last_bullet_idx is not None and
+                        last_bullet_idx > baseline_star_idx):
                     start_idx = last_bullet_idx
                     for i in range(start_idx + 1, content_end):
                         if self.RE_COMPLETION.match(lines[i].strip()):
