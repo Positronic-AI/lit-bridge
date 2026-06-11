@@ -212,6 +212,7 @@ async def observe_loop(
                 else:
                     log.info(f"[{ms.name}] No JSONL watcher for organic input")
                 ms._is_organic = True
+                ms._observe_started_at = time.monotonic()
                 ms.observing = True
                 log.info(f"[{ms.name}] Auto-observing organic interaction")
 
@@ -442,9 +443,15 @@ async def observe_loop(
                                       "event": "metadata", **meta})
 
                 # ── No-progress timeout ──
+                # Measured from BOTH last capture change and observation
+                # start. last_capture_change alone is stale on long-idle
+                # sessions: right after send, the CLI clears the input box
+                # and the screen briefly matches the old idle screen, so
+                # the timer reads minutes old and fires instantly.
                 elif (not ms._yielded and
                         new_state != SessionState.THINKING and
-                        (now - last_capture_change) > NO_PROGRESS_TIMEOUT):
+                        (now - last_capture_change) > NO_PROGRESS_TIMEOUT and
+                        (now - getattr(ms, '_observe_started_at', 0.0)) > NO_PROGRESS_TIMEOUT):
                     emit({"session": ms.name, "event": "error",
                           "message": "no progress timeout"})
                     ms.observing = False

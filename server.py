@@ -98,6 +98,7 @@ class ManagedSession:
         self._last_active: float = time.monotonic()
         self._paused: bool = False
         self._yielded: str = ""
+        self._observe_started_at: float = time.monotonic()
         if working_dir:
             project_dir = cc_project_dir(working_dir, config_dir)
             self._jsonl_watcher = JsonlWatcher(project_dir)
@@ -431,6 +432,7 @@ class Monitor:
         ms._baseline_completion_count = sum(
             1 for ln in full_capture.split('\n')
             if re.match(r'^\s*✻\s', ln))
+        ms._observe_started_at = time.monotonic()
         ms.observing = True
 
         try:
